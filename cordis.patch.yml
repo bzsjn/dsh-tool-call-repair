@@ -15,6 +15,7 @@
     - id: tool-call-repair
       name: 'dsh-tool-call-repair'
       config:
+        repairStream: true
         maxRetries: 2
         maxRetriesPerTurn: 5
         codes: ['*']

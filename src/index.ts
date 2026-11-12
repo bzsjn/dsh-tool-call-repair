@@ -1,29 +1,30 @@
 /**
  * dsh-tool-call-repair
  *
- * Keeps a turn alive when a model request fails in a recoverable way.
+ * Two layers, both needed:
  *
- * Observed failures on an OpenAI/Anthropic compatible gateway:
- *  - a tool_use block is closed before its input_json_delta finishes, so the
- *    adapter drops the call and raises MALFORMED_RESPONSE (not in the default
- *    retryable set, so the turn died);
- *  - a completed response carries no content (EMPTY_RESPONSE);
- *  - the stream ends early (STREAM_CLOSED / PI_AI_ERROR);
- *  - the same request repeated a moment later usually succeeds, which means
- *    these are transient transport faults rather than deterministic bugs.
+ * 1. llm/stream  -- keep the chunk protocol intact. The adapter drops a
+ *    tool-call block whose arguments JSON never finished and then raises
+ *    MALFORMED_RESPONSE, leaving a block-start without a block-end. This layer
+ *    closes every open block, so the turn ends as tool-calls/max-tokens
+ *    instead of dying. A half-written argument string is passed through as
+ *    text: the tool rejects it, the error goes back to the model, and the
+ *    model retries on its own.
  *
- * Policy: retry anything that could plausibly succeed on a second attempt,
- * with exponential backoff and a bounded budget. Codes that cannot be fixed by
- * repeating the identical request (user abort, context overflow, invalid
- * replay state, missing adapter) are never retried. Truncated JSON is never
- * rewritten: guessing the missing tail could change the command that runs.
+ * 2. agent/request-error -- retry the request first, with exponential backoff
+ *    and a bounded budget, because transient faults usually succeed on the
+ *    second attempt.
+ *
+ * Neither layer rewrites truncated JSON: guessing the missing tail could
+ * change the command that runs.
  */
 
-/** Public configuration accepted from `cordis.patch.yml`. */
 export interface Config {
-  /** Retries allowed per turn+step. `0` disables retrying but keeps logging. */
+  /** Keep chunks paired and close a truncated stream instead of failing it. */
+  repairStream?: boolean;
+  /** Retries allowed per turn+step. `0` disables retrying. */
   maxRetries?: number;
-  /** Retries allowed across one whole turn, so several steps cannot each burn a full budget. */
+  /** Retries allowed across one whole turn. */
   maxRetriesPerTurn?: number;
   /** Failure codes to retry. `['*']` means every code except the deny list. */
   codes?: string[];
@@ -44,7 +45,6 @@ interface Failure {
   message?: string;
 }
 
-/** Payload delivered by the `agent/request-error` waterfall. */
 export interface RequestErrorPayload {
   agent?: object;
   turn?: number;
@@ -56,21 +56,37 @@ export interface RequestErrorPayload {
 
 export type RequestErrorAction = { kind: 'retry' } | undefined;
 
+/** One frame of the model stream. Only the fields this plugin reads are typed. */
+export interface StreamChunk {
+  type: string;
+  index?: number;
+  blockType?: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  argumentsDelta?: string;
+  block?: { type: string; [key: string]: unknown };
+  reason?: { kind: string; [key: string]: unknown };
+  [key: string]: unknown;
+}
+
 export interface PluginContext {
   logger?: Logger;
-  on(
-    event: 'agent/request-error',
-    listener: (
-      payload: RequestErrorPayload,
-      next: () => Promise<RequestErrorAction>,
-    ) => Promise<RequestErrorAction>,
-  ): void;
+  on(event: 'agent/request-error', listener: (
+    payload: RequestErrorPayload,
+    next: () => Promise<RequestErrorAction>,
+  ) => Promise<RequestErrorAction>): void;
+  on(event: 'llm/stream', listener: (
+    options: unknown,
+    next: () => AsyncIterable<StreamChunk>,
+  ) => AsyncIterable<StreamChunk>): void;
 }
 
 /** Codes where repeating the identical request cannot help. */
 const NEVER_RETRY = new Set(['ABORTED', 'CONTEXT_WINDOW_EXCEEDED', 'INVALID_REPLAY_STATE', 'NO_ADAPTER']);
 
 const DEFAULTS = {
+  repairStream: true,
   maxRetries: 2,
   maxRetriesPerTurn: 5,
   codes: ['*'],
@@ -80,6 +96,7 @@ const DEFAULTS = {
 };
 
 interface ResolvedConfig {
+  repairStream: boolean;
   maxRetries: number;
   maxRetriesPerTurn: number;
   anyCode: boolean;
@@ -100,15 +117,25 @@ interface TurnBudget {
   used: number;
 }
 
+/** An open block being accumulated so it can be closed if the stream breaks. */
+interface OpenBlock {
+  type: string;
+  text: string;
+  args: string;
+  id: string | undefined;
+  name: string | undefined;
+}
+
 function positive(value: unknown, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function normalize(config?: Config): ResolvedConfig {
-  const raw = config ?? {};
+  const raw: Config = config ?? {};
   const codes = Array.isArray(raw.codes) ? raw.codes.map(String) : [...DEFAULTS.codes];
   return {
+    repairStream: raw.repairStream !== false,
     maxRetries: Math.floor(positive(raw.maxRetries, DEFAULTS.maxRetries)),
     maxRetriesPerTurn: Math.floor(positive(raw.maxRetriesPerTurn, DEFAULTS.maxRetriesPerTurn)),
     anyCode: codes.includes('*'),
@@ -122,6 +149,12 @@ function normalize(config?: Config): ResolvedConfig {
 function eligible(options: ResolvedConfig, code: string): boolean {
   if (NEVER_RETRY.has(code)) return false;
   return options.anyCode || options.codes.has(code);
+}
+
+function codeOf(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
 }
 
 /** Delay that resolves early when the turn is aborted. */
@@ -141,6 +174,30 @@ function backoffDelay(ms: number, signal?: RequestErrorPayload['signal']): Promi
   });
 }
 
+function openBlocks(open: Map<number, OpenBlock>): StreamChunk[] {
+  const closing: StreamChunk[] = [];
+  for (const [index, block] of open) {
+    let content: { type: string; [key: string]: unknown };
+    if (block.type === 'tool-call') {
+      // Pass the raw (possibly truncated) argument text through: the tool
+      // rejects it and the error reaches the model, which then retries.
+      content = {
+        type: 'tool-call',
+        id: block.id ?? '',
+        name: block.name ?? '',
+        arguments: block.args.length > 0 ? block.args : '{}',
+      };
+    } else if (block.type === 'reasoning') {
+      content = { type: 'reasoning', text: block.text };
+    } else {
+      content = { type: 'text', text: block.text };
+    }
+    closing.push({ type: 'block-end', index, block: content });
+  }
+  open.clear();
+  return closing;
+}
+
 export const name = 'tool-call-repair';
 
 export function apply(ctx: PluginContext, config?: Config): void {
@@ -148,6 +205,10 @@ export function apply(ctx: PluginContext, config?: Config): void {
   const logger = ctx.logger;
   const steps = new WeakMap<object, StepBudget>();
   const turns = new WeakMap<object, TurnBudget>();
+
+  if (options.repairStream) {
+    ctx.on('llm/stream', (_options, next) => repair(next(), logger));
+  }
 
   function takeBudget(agent: object, turn: number | undefined, step: number | undefined): number | undefined {
     let turnRecord = turns.get(agent);
@@ -170,7 +231,6 @@ export function apply(ctx: PluginContext, config?: Config): void {
   }
 
   ctx.on('agent/request-error', async (payload, next) => {
-    // Another recovery hook may decide first; a throw belongs to the caller.
     const downstream = await next();
     if (downstream !== undefined && downstream !== null) return downstream;
 
@@ -186,14 +246,11 @@ export function apply(ctx: PluginContext, config?: Config): void {
 
       const attempt = takeBudget(agent, payload.turn, payload.step);
       if (attempt === undefined) {
-        logger?.warn?.(
-          `tool-call-repair: budget spent for ${code} on turn ${payload.turn} step ${payload.step}`,
-        );
+        logger?.warn?.(`tool-call-repair: budget spent for ${code} on turn ${payload.turn} step ${payload.step}`);
         return downstream;
       }
 
-      const exponential = options.initialDelayMs * 2 ** (attempt - 1);
-      const capped = Math.min(exponential, options.maxDelayMs);
+      const capped = Math.min(options.initialDelayMs * 2 ** (attempt - 1), options.maxDelayMs);
       const jitter = 1 - options.jitterRatio + 2 * options.jitterRatio * Math.random();
       const delayMs = Math.round(Math.min(capped * jitter, options.maxDelayMs));
 
@@ -203,13 +260,77 @@ export function apply(ctx: PluginContext, config?: Config): void {
 
       if (delayMs > 0) await backoffDelay(delayMs, payload.signal);
       if (payload.signal?.aborted) return downstream;
-
       return { kind: 'retry' };
     } catch (error) {
-      // The recovery hook must never break the turn itself.
       const detail = error instanceof Error ? error.message : String(error);
       logger?.warn?.(`tool-call-repair: recovery hook failed: ${detail}`);
       return downstream;
     }
   });
+}
+
+/** Wrap one model stream so a truncated frame cannot leave the turn half-open. */
+async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): AsyncGenerator<StreamChunk> {
+  const open = new Map<number, OpenBlock>();
+  let finished = false;
+
+  try {
+    for await (const chunk of source) {
+      if (typeof chunk !== 'object' || chunk === null) {
+        yield chunk;
+        continue;
+      }
+      const index = typeof chunk.index === 'number' ? chunk.index : undefined;
+
+      if (chunk.type === 'block-start' && index !== undefined) {
+        open.set(index, {
+          type: String(chunk.blockType ?? 'text'),
+          text: '',
+          args: '',
+          id: undefined,
+          name: undefined,
+        });
+      } else if ((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') && index !== undefined) {
+        const block = open.get(index);
+        if (block !== undefined) block.text += chunk.text ?? '';
+      } else if (chunk.type === 'tool-call-delta' && index !== undefined) {
+        const block = open.get(index);
+        if (block !== undefined) {
+          block.args += chunk.argumentsDelta ?? '';
+          if (typeof chunk.id === 'string' && chunk.id.length > 0) block.id = chunk.id;
+          if (typeof chunk.name === 'string' && chunk.name.length > 0) block.name = chunk.name;
+        }
+      } else if (chunk.type === 'block-end' && index !== undefined) {
+        open.delete(index);
+      } else if (chunk.type === 'finish') {
+        finished = true;
+        if (open.size > 0) {
+          logger?.warn?.(`tool-call-repair: closing ${open.size} unpaired block(s) before finish`);
+          for (const closing of openBlocks(open)) yield closing;
+        }
+      }
+
+      yield chunk;
+    }
+  } catch (error) {
+    const code = codeOf(error);
+    // Codes that cannot be fixed by closing blocks must reach the caller.
+    if (code === undefined || NEVER_RETRY.has(code)) throw error;
+
+    const pending = [...open.values()];
+    const hadToolCall = pending.some((block) => block.type === 'tool-call');
+    logger?.warn?.(`tool-call-repair: stream broke with ${code}; closing ${pending.length} block(s) ${hadToolCall ? 'as tool-calls' : 'as text'}`);
+
+    for (const closing of openBlocks(open)) yield closing;
+    // tool-calls lets the loop dispatch the broken call: the tool rejects the
+    // malformed arguments, the model reads that error and retries itself.
+    yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
+    return;
+  }
+
+  if (open.size > 0) {
+    logger?.warn?.(`tool-call-repair: stream ended with ${open.size} unpaired block(s)`);
+    for (const closing of openBlocks(open)) yield closing;
+    if (!finished) yield { type: 'finish', reason: { kind: 'max-tokens' } };
+  }
 }
