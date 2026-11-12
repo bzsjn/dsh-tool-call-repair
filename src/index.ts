@@ -19,7 +19,9 @@
  * change the command that runs.
  */
 
-export interface Config {
+import z from '@deepseek-ai/schemastery';
+
+interface ConfigShape {
   /** Keep chunks paired and close a truncated stream instead of failing it. */
   repairStream?: boolean;
   /** Retry failed model requests. `false` disables the whole retry layer. */
@@ -121,6 +123,18 @@ const DEFAULTS = {
   jitterRatio: 0.2,
 };
 
+/** Schema the plugin manager renders as a form. `volatile()` fields are editable there. */
+export const Config = z.object({
+  工具修复: z.boolean().default(true).description('流层协议修复：补发缺失的 block-end，按 tool-calls 收尾并派发被截断的调用'),
+  重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试'),
+  token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预'),
+  maxRetriesPerTurn: z.natural().default(40),
+  codes: z.array(z.string()).default(['*']),
+  initialDelayMs: z.natural().default(1000),
+  maxDelayMs: z.natural().default(240000),
+  jitterRatio: z.number().min(0).max(1).default(0.2),
+});
+
 interface ResolvedConfig {
   /** 工具修复 */
   toolFix: boolean;
@@ -161,8 +175,8 @@ function positive(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-function normalize(config?: Config): ResolvedConfig {
-  const raw: Config = config ?? {};
+function normalize(config?: ConfigShape): ResolvedConfig {
+  const raw: ConfigShape = config ?? {};
   const codes = Array.isArray(raw.codes) ? raw.codes.map(String) : [...DEFAULTS.codes];
 
   // Chinese switches win when present; the English keys stay supported.
@@ -265,7 +279,7 @@ function isContentFrame(chunk: StreamChunk): boolean {
 
 export const name = 'tool-call-repair';
 
-export function apply(ctx: PluginContext, config?: Config): void {
+export function apply(ctx: PluginContext, config?: ConfigShape): void {
   const options = normalize(config);
   const logger = ctx.logger;
   const steps = new WeakMap<object, StepBudget>();
@@ -389,13 +403,13 @@ async function* repair(
           logger?.warn?.(
             `tool-call-repair: ${code} after output; closing ${pending.length} block(s) as ${hadToolCall ? 'tool-calls' : 'max-tokens'}`,
           );
-          for (const closing of openBlocks(open, options.toolFix)) yield closing;
+          for (const closing of openBlocks(open, toolFix)) yield closing;
           yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
           return;
         }
         if (open.size > 0) {
           logger?.warn?.(`tool-call-repair: closing ${open.size} unpaired block(s) before finish`);
-          for (const closing of openBlocks(open, options.toolFix)) yield closing;
+          for (const closing of openBlocks(open, toolFix)) yield closing;
         }
       }
 
@@ -422,7 +436,7 @@ async function* repair(
     const hadToolCall = pending.some((block) => block.type === 'tool-call');
     logger?.warn?.(`tool-call-repair: stream broke with ${code}; closing ${pending.length} block(s) ${hadToolCall ? 'as tool-calls' : 'as text'}`);
 
-    for (const closing of openBlocks(open, options.toolFix)) yield closing;
+    for (const closing of openBlocks(open, toolFix)) yield closing;
     // tool-calls lets the loop dispatch the broken call: the tool rejects the
     // malformed arguments, the model reads that error and retries itself.
     yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
@@ -431,7 +445,7 @@ async function* repair(
 
   if (open.size > 0) {
     logger?.warn?.(`tool-call-repair: stream ended with ${open.size} unpaired block(s)`);
-    for (const closing of openBlocks(open, options.toolFix)) yield closing;
+    for (const closing of openBlocks(open, toolFix)) yield closing;
     if (!finished) yield { type: 'finish', reason: { kind: 'max-tokens' } };
   }
 }
