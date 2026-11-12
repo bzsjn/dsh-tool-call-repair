@@ -125,9 +125,9 @@ const DEFAULTS = {
 
 /** Schema the plugin manager renders as a form. `volatile()` fields are editable there. */
 export const Config = z.object({
-  工具修复: z.boolean().default(true).description('流层协议修复：补发缺失的 block-end，按 tool-calls 收尾并派发被截断的调用'),
-  重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试'),
-  token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预'),
+  工具修复: z.boolean().default(true).description('流层协议修复：补发缺失的 block-end，按 tool-calls 收尾并派发被截断的调用').volatile(),
+  重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试').volatile(),
+  token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预').volatile(),
   maxRetriesPerTurn: z.natural().default(40),
   codes: z.array(z.string()).default(['*']),
   initialDelayMs: z.natural().default(1000),
@@ -175,8 +175,25 @@ function positive(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+/**
+ * Volatile schema fields arrive as cosmokit references ({ get, [write] }), not
+ * plain values, because .volatile() is what makes a field editable in the
+ * plugin manager. Read through the reference; leave plain values alone.
+ */
+function unwrap(value: unknown): unknown {
+  return value !== null && typeof value === 'object' && typeof (value as { get?: unknown }).get === 'function'
+    ? (value as { get: () => unknown }).get()
+    : value;
+}
+
+function unwrapConfig(config: ConfigShape | undefined): ConfigShape {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config ?? {})) out[key] = unwrap(value);
+  return out as ConfigShape;
+}
+
 function normalize(config?: ConfigShape): ResolvedConfig {
-  const raw: ConfigShape = config ?? {};
+  const raw: ConfigShape = unwrapConfig(config);
   const codes = Array.isArray(raw.codes) ? raw.codes.map(String) : [...DEFAULTS.codes];
 
   // Chinese switches win when present; the English keys stay supported.
