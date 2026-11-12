@@ -1,0 +1,56 @@
+{
+  "name": "dsh-tool-call-repair",
+  "version": "0.1.0",
+  "description": "Keeps a turn alive when a model request fails recoverably: any failure code is retried with exponential backoff under a bounded budget, so transient gateway faults (truncated tool arguments, empty completions, early stream ends) do not end the task. Toggleable from the plugin manager.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "src",
+    "tsconfig.json",
+    "README.md",
+    "icon.svg"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "bundle",
+    "tool-call",
+    "retry",
+    "malformed-response"
+  ],
+  "icon": "./icon.svg",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  }
+}

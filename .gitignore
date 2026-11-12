@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# Build scratch, never needed at runtime (lib/ is committed on purpose:
+# this package ships compiled JS because no bundler is required to install it).
+*.tsbuildinfo
+.tsbuildinfo

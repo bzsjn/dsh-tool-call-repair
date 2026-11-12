@@ -1,0 +1,23 @@
+# dsh-tool-call-repair bundle patch
+#
+# Mounts the retry plugin as one togglable entry. Disable it from the plugin
+# manager (or by flipping `disabled` here) without uninstalling the package.
+#
+# Why this exists: a gateway may fail a model request in ways that repeat
+# successfully a moment later -- a tool_use block closed before its
+# input_json_delta finishes (MALFORMED_RESPONSE), an empty completion, or a
+# stream that ends early. Those are transport faults, not deterministic bugs,
+# so a bounded retry keeps the turn alive instead of ending the task.
+#
+# `codes: ['*']` retries every failure except the deny list inside the plugin
+# (ABORTED, CONTEXT_WINDOW_EXCEEDED, INVALID_REPLAY_STATE, NO_ADAPTER).
+- insert:
+    - id: tool-call-repair
+      name: 'dsh-tool-call-repair'
+      config:
+        maxRetries: 2
+        maxRetriesPerTurn: 5
+        codes: ['*']
+        initialDelayMs: 250
+        maxDelayMs: 4000
+        jitterRatio: 0.25
