@@ -29,6 +29,20 @@
 
 本插件**不修补**残缺 JSON。猜补缺失的尾部会改变将要执行的命令。
 
+## 失败路径分工
+
+模型请求失败有两条到达路径，按「是否已经产生输出」分工，避免重复输出：
+
+| 路径 | 已产生输出 | 处理 |
+|---|---|---|
+| 流内抛异常 | 否 | 原样抛出 → `agent/request-error` 重试（本次尝试干净，无副作用） |
+| 流内抛异常 | 是 | 就地闭合未闭合块 + 降级为 `tool-calls` / `max-tokens` |
+| `finish{kind:"error"}` | 否 | 原样透传 → 重试 |
+| `finish{kind:"error"}` | 是 | 闭合 + 降级 |
+| 黑名单码（`ABORTED`、`CONTEXT_WINDOW_EXCEEDED`、`INVALID_REPLAY_STATE`、`NO_ADAPTER`） | 任意 | 原样透传，不降级 |
+
+降级后：带工具调用则结束为 `tool-calls`，工具拿到残缺参数 schema 失败、错误回给模型、模型自行重写；纯文本则结束为 `max-tokens`，本轮收尾、下一条继续。两种情况都不会死会话。
+
 ## 配置
 
 `cordis.patch.yml`：
