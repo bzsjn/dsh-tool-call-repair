@@ -198,6 +198,24 @@ function openBlocks(open: Map<number, OpenBlock>): StreamChunk[] {
   return closing;
 }
 
+/** Failure code carried by a terminal error finish frame, when there is one. */
+function failureCodeOf(reason: StreamChunk['reason']): string | undefined {
+  if (typeof reason !== 'object' || reason === null || reason.kind !== 'error') return undefined;
+  const failure = (reason as { failure?: unknown }).failure;
+  if (typeof failure !== 'object' || failure === null) return undefined;
+  const code = (failure as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/** Whether this frame carries model content that the caller already consumed. */
+function isContentFrame(chunk: StreamChunk): boolean {
+  return (
+    chunk.type === 'block-start' ||
+    chunk.type === 'block-end' ||
+    (typeof chunk.type === 'string' && chunk.type.endsWith('-delta'))
+  );
+}
+
 export const name = 'tool-call-repair';
 
 export function apply(ctx: PluginContext, config?: Config): void {
@@ -273,6 +291,7 @@ export function apply(ctx: PluginContext, config?: Config): void {
 async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): AsyncGenerator<StreamChunk> {
   const open = new Map<number, OpenBlock>();
   let finished = false;
+  let produced = false;
 
   try {
     for await (const chunk of source) {
@@ -304,18 +323,34 @@ async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): Asy
         open.delete(index);
       } else if (chunk.type === 'finish') {
         finished = true;
+        const code = failureCodeOf(chunk.reason);
+        if (code !== undefined && !NEVER_RETRY.has(code) && produced) {
+          // Output already reached the caller; a retry would duplicate it.
+          // Close the frame and end the turn instead of failing the task.
+          const pending = [...open.values()];
+          const hadToolCall = pending.some((block) => block.type === 'tool-call');
+          logger?.warn?.(
+            `tool-call-repair: ${code} after output; closing ${pending.length} block(s) as ${hadToolCall ? 'tool-calls' : 'max-tokens'}`,
+          );
+          for (const closing of openBlocks(open)) yield closing;
+          yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
+          return;
+        }
         if (open.size > 0) {
           logger?.warn?.(`tool-call-repair: closing ${open.size} unpaired block(s) before finish`);
           for (const closing of openBlocks(open)) yield closing;
         }
       }
 
+      if (isContentFrame(chunk)) produced = true;
       yield chunk;
     }
   } catch (error) {
     const code = codeOf(error);
     // Codes that cannot be fixed by closing blocks must reach the caller.
     if (code === undefined || NEVER_RETRY.has(code)) throw error;
+    // Nothing reached the caller yet: let the retry hook own this attempt.
+    if (!produced) throw error;
 
     const pending = [...open.values()];
     const hadToolCall = pending.some((block) => block.type === 'tool-call');
