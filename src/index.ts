@@ -22,6 +22,20 @@
 export interface Config {
   /** Keep chunks paired and close a truncated stream instead of failing it. */
   repairStream?: boolean;
+  /** Retry failed model requests. `false` disables the whole retry layer. */
+  retryEnabled?: boolean;
+  /**
+   * Dispatch a tool call whose arguments arrived truncated so the tool rejects
+   * it and the model reads that error. `false` drops the call instead and ends
+   * the turn as max-tokens.
+   */
+  dispatchTruncatedToolCalls?: boolean;
+  /** 工具修复：参数截断时闭合协议并派发该调用，让模型读到错误后重写。 */
+  '工具修复'?: boolean;
+  /** 重试次数：连接或服务端失败的重试上限，0 表示不重试。 */
+  '重试次数'?: number;
+  /** token上限：本轮输出达到该值即按截断收尾，0 表示不干预。 */
+  'token上限'?: number;
   /** Retries allowed per turn+step. `0` disables retrying. */
   maxRetries?: number;
   /** Retries allowed across one whole turn. */
@@ -83,22 +97,38 @@ export interface PluginContext {
 }
 
 /** Codes where repeating the identical request cannot help. */
-const NEVER_RETRY = new Set(['ABORTED', 'CONTEXT_WINDOW_EXCEEDED', 'INVALID_REPLAY_STATE', 'NO_ADAPTER']);
+const NEVER_RETRY = new Set([
+  'ABORTED',
+  'CONTEXT_WINDOW_EXCEEDED',
+  'INVALID_REPLAY_STATE',
+  'NO_ADAPTER',
+  'AUTH',
+  'INVALID_REQUEST',
+  'INVALID_CREDENTIAL',
+  'QUOTA_EXCEEDED',
+  'ACCOUNT_QUOTA_EXCEEDED',
+]);
 
 const DEFAULTS = {
   repairStream: true,
-  maxRetries: 2,
-  maxRetriesPerTurn: 5,
+  retryEnabled: true,
+  dispatchTruncatedToolCalls: true,
+  maxRetries: 12,
+  maxRetriesPerTurn: 40,
   codes: ['*'],
-  initialDelayMs: 250,
-  maxDelayMs: 4000,
-  jitterRatio: 0.25,
+  initialDelayMs: 1000,
+  maxDelayMs: 240000,
+  jitterRatio: 0.2,
 };
 
 interface ResolvedConfig {
-  repairStream: boolean;
-  maxRetries: number;
-  maxRetriesPerTurn: number;
+  /** 工具修复 */
+  toolFix: boolean;
+  /** 重试次数 */
+  retries: number;
+  retriesPerTurn: number;
+  /** token上限 */
+  tokenCap: number;
   anyCode: boolean;
   codes: Set<string>;
   initialDelayMs: number;
@@ -134,10 +164,24 @@ function positive(value: unknown, fallback: number): number {
 function normalize(config?: Config): ResolvedConfig {
   const raw: Config = config ?? {};
   const codes = Array.isArray(raw.codes) ? raw.codes.map(String) : [...DEFAULTS.codes];
+
+  // Chinese switches win when present; the English keys stay supported.
+  const toolFix =
+    raw['工具修复'] !== undefined
+      ? raw['工具修复'] !== false
+      : raw.repairStream !== false && raw.dispatchTruncatedToolCalls !== false;
+
+  const retries = Math.floor(
+    positive(raw['重试次数'] ?? (raw.retryEnabled === false ? 0 : raw.maxRetries), DEFAULTS.maxRetries),
+  );
+
+  const tokenCap = Math.floor(positive(raw['token上限'], 0));
+
   return {
-    repairStream: raw.repairStream !== false,
-    maxRetries: Math.floor(positive(raw.maxRetries, DEFAULTS.maxRetries)),
-    maxRetriesPerTurn: Math.floor(positive(raw.maxRetriesPerTurn, DEFAULTS.maxRetriesPerTurn)),
+    toolFix,
+    retries,
+    retriesPerTurn: Math.floor(positive(raw.maxRetriesPerTurn, DEFAULTS.maxRetriesPerTurn)),
+    tokenCap,
     anyCode: codes.includes('*'),
     codes: new Set(codes),
     initialDelayMs: positive(raw.initialDelayMs, DEFAULTS.initialDelayMs),
@@ -174,11 +218,14 @@ function backoffDelay(ms: number, signal?: RequestErrorPayload['signal']): Promi
   });
 }
 
-function openBlocks(open: Map<number, OpenBlock>): StreamChunk[] {
+function openBlocks(open: Map<number, OpenBlock>, dispatchTruncatedToolCalls: boolean): StreamChunk[] {
   const closing: StreamChunk[] = [];
   for (const [index, block] of open) {
     let content: { type: string; [key: string]: unknown };
     if (block.type === 'tool-call') {
+      // Dropping the call is the alternative to dispatching it: the turn then
+      // ends as max-tokens because no tool-call block reaches the loop.
+      if (!dispatchTruncatedToolCalls) continue;
       // Pass the raw (possibly truncated) argument text through: the tool
       // rejects it and the error reaches the model, which then retries.
       content = {
@@ -224,8 +271,8 @@ export function apply(ctx: PluginContext, config?: Config): void {
   const steps = new WeakMap<object, StepBudget>();
   const turns = new WeakMap<object, TurnBudget>();
 
-  if (options.repairStream) {
-    ctx.on('llm/stream', (_options, next) => repair(next(), logger));
+  if (options.toolFix) {
+    ctx.on('llm/stream', (_options, next) => repair(next(), logger, options.tokenCap, options.toolFix));
   }
 
   function takeBudget(agent: object, turn: number | undefined, step: number | undefined): number | undefined {
@@ -241,14 +288,14 @@ export function apply(ctx: PluginContext, config?: Config): void {
       stepRecord = { turn, step, used: 0 };
       steps.set(agent, stepRecord);
     }
-    if (stepRecord.used >= options.maxRetries) return undefined;
+    if (stepRecord.used >= options.retries) return undefined;
 
     stepRecord.used += 1;
     turnRecord.used += 1;
     return stepRecord.used;
   }
 
-  ctx.on('agent/request-error', async (payload, next) => {
+  if (options.retries > 0) ctx.on('agent/request-error', async (payload, next) => {
     const downstream = await next();
     if (downstream !== undefined && downstream !== null) return downstream;
 
@@ -288,10 +335,16 @@ export function apply(ctx: PluginContext, config?: Config): void {
 }
 
 /** Wrap one model stream so a truncated frame cannot leave the turn half-open. */
-async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): AsyncGenerator<StreamChunk> {
+async function* repair(
+  source: AsyncIterable<StreamChunk>,
+  logger: Logger | undefined,
+  tokenCap: number,
+  toolFix: boolean,
+): AsyncGenerator<StreamChunk> {
   const open = new Map<number, OpenBlock>();
   let finished = false;
   let produced = false;
+  let spent = 0;
 
   try {
     for await (const chunk of source) {
@@ -311,14 +364,18 @@ async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): Asy
         });
       } else if ((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') && index !== undefined) {
         const block = open.get(index);
-        if (block !== undefined) block.text += chunk.text ?? '';
+        const added = chunk.text ?? '';
+        if (block !== undefined) block.text += added;
+        spent += added.length;
       } else if (chunk.type === 'tool-call-delta' && index !== undefined) {
         const block = open.get(index);
+        const added = chunk.argumentsDelta ?? '';
         if (block !== undefined) {
-          block.args += chunk.argumentsDelta ?? '';
+          block.args += added;
           if (typeof chunk.id === 'string' && chunk.id.length > 0) block.id = chunk.id;
           if (typeof chunk.name === 'string' && chunk.name.length > 0) block.name = chunk.name;
         }
+        spent += added.length;
       } else if (chunk.type === 'block-end' && index !== undefined) {
         open.delete(index);
       } else if (chunk.type === 'finish') {
@@ -332,18 +389,27 @@ async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): Asy
           logger?.warn?.(
             `tool-call-repair: ${code} after output; closing ${pending.length} block(s) as ${hadToolCall ? 'tool-calls' : 'max-tokens'}`,
           );
-          for (const closing of openBlocks(open)) yield closing;
+          for (const closing of openBlocks(open, options.toolFix)) yield closing;
           yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
           return;
         }
         if (open.size > 0) {
           logger?.warn?.(`tool-call-repair: closing ${open.size} unpaired block(s) before finish`);
-          for (const closing of openBlocks(open)) yield closing;
+          for (const closing of openBlocks(open, options.toolFix)) yield closing;
         }
       }
 
       if (isContentFrame(chunk)) produced = true;
       yield chunk;
+
+      if (tokenCap > 0 && spent >= tokenCap) {
+        const closing = openBlocks(open, toolFix);
+        const hadToolCall = closing.some((c) => c.block?.type === 'tool-call');
+        logger?.warn?.(`tool-call-repair: token上限 reached ${spent}/${tokenCap}; truncating the turn`);
+        for (const frame of closing) yield frame;
+        yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
+        return;
+      }
     }
   } catch (error) {
     const code = codeOf(error);
@@ -356,7 +422,7 @@ async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): Asy
     const hadToolCall = pending.some((block) => block.type === 'tool-call');
     logger?.warn?.(`tool-call-repair: stream broke with ${code}; closing ${pending.length} block(s) ${hadToolCall ? 'as tool-calls' : 'as text'}`);
 
-    for (const closing of openBlocks(open)) yield closing;
+    for (const closing of openBlocks(open, options.toolFix)) yield closing;
     // tool-calls lets the loop dispatch the broken call: the tool rejects the
     // malformed arguments, the model reads that error and retries itself.
     yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
@@ -365,7 +431,7 @@ async function* repair(source: AsyncIterable<StreamChunk>, logger?: Logger): Asy
 
   if (open.size > 0) {
     logger?.warn?.(`tool-call-repair: stream ended with ${open.size} unpaired block(s)`);
-    for (const closing of openBlocks(open)) yield closing;
+    for (const closing of openBlocks(open, options.toolFix)) yield closing;
     if (!finished) yield { type: 'finish', reason: { kind: 'max-tokens' } };
   }
 }

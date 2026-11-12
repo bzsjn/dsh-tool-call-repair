@@ -43,21 +43,33 @@
 
 降级后：带工具调用则结束为 `tool-calls`，工具拿到残缺参数 schema 失败、错误回给模型、模型自行重写；纯文本则结束为 `max-tokens`，本轮收尾、下一条继续。两种情况都不会死会话。
 
-## 配置
+## 三个开关
 
 `cordis.patch.yml`：
 
 ```yaml
 config:
-  maxRetries: 2
-  maxRetriesPerTurn: 5
+  工具修复: true
+  重试次数: 12
+  token上限: 0
+  maxRetriesPerTurn: 40
   codes: ['*']
-  initialDelayMs: 250
-  maxDelayMs: 4000
-  jitterRatio: 0.25
+  initialDelayMs: 1000
+  maxDelayMs: 240000
+  jitterRatio: 0.2
 ```
 
-`maxRetries: 0` 等于只记日志不重试。
+| 开关 | 作用 | 关闭时 |
+|---|---|---|
+| `工具修复` | 流层补发缺失的 `block-end`，把截断的 tool call 按 `tool-calls` 收尾并派发，模型读到参数错误后重写 | 不接管流，截断会照原样失败 |
+| `重试次数` | 模型请求失败的重试上限。覆盖 `TRANSPORT`、`SERVER`、`TIMEOUT`、`RATE_LIMIT`、`EMPTY_RESPONSE`、`MALFORMED_RESPONSE` | `0` 完全不注册重试层 |
+| `token上限` | 本轮输出字符预算，达到即补 `block-end` 并按截断收尾 | `0` 不干预，交给服务端 |
+
+`重试次数: 12` 的退避阶梯：1s,2s,4s,8s,16s,32s,64s,128s,240s ×4，累计约 20 分钟。DSH 内置 `llm-retry` 先跑 5 次（约 15 秒），然后本插件接着跑长窗口。
+
+`token上限` 按字符计，不是 token 数。中文约 1 字≈1 token，英文约 4 字符≈1 token，所以 32000 大致对应 8k–32k token 区间。服务端不认 `max_tokens`（实测传 200 却输出 13424），这个开关是客户端自己停。
+
+英文键 `repairStream` / `retryEnabled` / `maxRetries` / `dispatchTruncatedToolCalls` 仍然兼容，中文键优先。
 
 ## 目录结构
 

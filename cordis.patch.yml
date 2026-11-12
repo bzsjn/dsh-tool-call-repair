@@ -1,24 +1,26 @@
 # dsh-tool-call-repair bundle patch
 #
-# Mounts the retry plugin as one togglable entry. Disable it from the plugin
-# manager (or by flipping `disabled` here) without uninstalling the package.
+# 三个开关，插件管理页也能单独启停整个插件。
 #
-# Why this exists: a gateway may fail a model request in ways that repeat
-# successfully a moment later -- a tool_use block closed before its
-# input_json_delta finishes (MALFORMED_RESPONSE), an empty completion, or a
-# stream that ends early. Those are transport faults, not deterministic bugs,
-# so a bounded retry keeps the turn alive instead of ending the task.
-#
-# `codes: ['*']` retries every failure except the deny list inside the plugin
-# (ABORTED, CONTEXT_WINDOW_EXCEEDED, INVALID_REPLAY_STATE, NO_ADAPTER).
+#   工具修复    流层协议修复。上游把工具参数截断时，补发缺失的 block-end，
+#               按 tool-calls / max-tokens 正常收尾，而不是让整轮失败。
+#               同时决定残缺的工具调用是派发出去（模型会读到参数错误并重写），
+#               还是丢弃。
+#   重试次数    模型请求失败后的重试上限。覆盖 TRANSPORT（网关连接重置）、
+#               SERVER、TIMEOUT、RATE_LIMIT、EMPTY_RESPONSE、MALFORMED_RESPONSE。
+#               退避阶梯 1s,2s,4s,8s,16s,32s,64s,128s,240s...，12 次约 20 分钟。
+#               DSH 内置 llm-retry 先跑自己的 5 次（约 15 秒），然后本插件接着跑长窗口。
+#   token上限   本轮输出字符预算。达到即补发 block-end 并按截断收尾。
+#               服务端不认 max_tokens，所以由客户端自己停。0 表示不干预。
 - insert:
     - id: tool-call-repair
       name: 'dsh-tool-call-repair'
       config:
-        repairStream: true
-        maxRetries: 2
-        maxRetriesPerTurn: 5
+        工具修复: true
+        重试次数: 12
+        token上限: 0
+        maxRetriesPerTurn: 40
         codes: ['*']
-        initialDelayMs: 250
-        maxDelayMs: 4000
-        jitterRatio: 0.25
+        initialDelayMs: 1000
+        maxDelayMs: 240000
+        jitterRatio: 0.2
