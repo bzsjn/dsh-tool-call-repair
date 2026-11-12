@@ -20,6 +20,7 @@
     "src",
     "tsconfig.json",
     "README.md",
+    "LICENSE",
     "icon.svg"
   ],
   "keywords": [
