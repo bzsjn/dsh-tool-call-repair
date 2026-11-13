@@ -121,11 +121,15 @@ const DEFAULTS = {
   initialDelayMs: 1000,
   maxDelayMs: 240000,
   jitterRatio: 0.2,
+  autoContinue: false,
+  continueRounds: 3,
 };
 
 /** Schema the plugin manager renders as a form. `volatile()` fields are editable there. */
 export const Config = z.object({
   工具修复: z.boolean().default(true).description('流层协议修复：补发缺失的 block-end，按 tool-calls 收尾并派发被截断的调用').volatile(),
+  自动续写: z.boolean().default(false).description('达到输出上限后自动再发一次请求接着写，不中断本轮').volatile(),
+  续写轮数: z.natural().default(3).description('自动续写的最大轮数，到顶即按截断收尾').volatile(),
   重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试').volatile(),
   token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预').volatile(),
   maxRetriesPerTurn: z.natural().default(40).description('每个 turn 加 step 的重试总预算').volatile(),
@@ -143,6 +147,10 @@ interface ResolvedConfig {
   retriesPerTurn: number;
   /** token上限 */
   tokenCap: number;
+  /** 自动续写 */
+  autoContinue: boolean;
+  /** 续写轮数 */
+  continueRounds: number;
   anyCode: boolean;
   codes: Set<string>;
   initialDelayMs: number;
@@ -208,11 +216,19 @@ function normalize(config?: ConfigShape): ResolvedConfig {
 
   const tokenCap = Math.floor(positive(raw['token上限'], 0));
 
+  const autoContinue =
+    raw['自动续写'] !== undefined ? raw['自动续写'] === true : raw.autoContinue === true;
+  const continueRounds = Math.floor(
+    positive(raw['续写轮数'] ?? raw.continueRounds, DEFAULTS.continueRounds),
+  );
+
   return {
     toolFix,
     retries,
     retriesPerTurn: Math.floor(positive(raw.maxRetriesPerTurn, DEFAULTS.maxRetriesPerTurn)),
     tokenCap,
+    autoContinue,
+    continueRounds,
     anyCode: codes.includes('*'),
     codes: new Set(codes),
     initialDelayMs: positive(raw.initialDelayMs, DEFAULTS.initialDelayMs),
@@ -304,11 +320,11 @@ export function apply(ctx: PluginContext, config?: ConfigShape): void {
   const steps = new WeakMap<object, StepBudget>();
   const turns = new WeakMap<object, TurnBudget>();
 
-  // Registered unconditionally: 工具修复 may be switched on after mount.
-  ctx.on('llm/stream', (_options, next) => {
+  // Registered unconditionally: 工具修复 and 自动续写 may be switched on after mount.
+  ctx.on('llm/stream', (options, next) => {
     const live = read();
-    if (!live.toolFix) return next();
-    return repair(next(), logger, live.tokenCap, live.toolFix);
+    if (!live.toolFix && !live.autoContinue) return next();
+    return repair(next, options, logger, live);
   });
 
   function takeBudget(
@@ -379,104 +395,150 @@ export function apply(ctx: PluginContext, config?: ConfigShape): void {
   });
 }
 
+interface StreamRequest {
+  messages?: unknown[];
+}
+
 /** Wrap one model stream so a truncated frame cannot leave the turn half-open. */
 async function* repair(
-  source: AsyncIterable<StreamChunk>,
+  next: () => AsyncIterable<StreamChunk>,
+  options: StreamRequest,
   logger: Logger | undefined,
-  tokenCap: number,
-  toolFix: boolean,
+  live: ResolvedConfig,
 ): AsyncGenerator<StreamChunk> {
-  const open = new Map<number, OpenBlock>();
-  let finished = false;
-  let produced = false;
+  const { tokenCap, toolFix, autoContinue, continueRounds } = live;
+  let round = 0;
+  let offset = 0;
   let spent = 0;
+  let produced = false;
+  let carried = '';
+
+  for (;;) {
+    const open = new Map<number, OpenBlock>();
+    let finished = false;
+    let truncated = false;
+    let text = '';
+    let topIndex = -1;
+    const shift = (chunk: StreamChunk): StreamChunk =>
+      offset === 0 || typeof chunk.index !== 'number' ? chunk : { ...chunk, index: chunk.index + offset };
 
   try {
-    for await (const chunk of source) {
-      if (typeof chunk !== 'object' || chunk === null) {
-        yield chunk;
-        continue;
-      }
-      const index = typeof chunk.index === 'number' ? chunk.index : undefined;
+      for await (const chunk of next()) {
+        if (typeof chunk !== 'object' || chunk === null) {
+          yield chunk;
+          continue;
+        }
+        const index = typeof chunk.index === 'number' ? chunk.index : undefined;
+        if (index !== undefined && index > topIndex) topIndex = index;
 
       if (chunk.type === 'block-start' && index !== undefined) {
-        open.set(index, {
-          type: String(chunk.blockType ?? 'text'),
-          text: '',
-          args: '',
-          id: undefined,
-          name: undefined,
-        });
-      } else if ((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') && index !== undefined) {
-        const block = open.get(index);
-        const added = chunk.text ?? '';
-        if (block !== undefined) block.text += added;
-        spent += added.length;
-      } else if (chunk.type === 'tool-call-delta' && index !== undefined) {
-        const block = open.get(index);
-        const added = chunk.argumentsDelta ?? '';
-        if (block !== undefined) {
-          block.args += added;
-          if (typeof chunk.id === 'string' && chunk.id.length > 0) block.id = chunk.id;
-          if (typeof chunk.name === 'string' && chunk.name.length > 0) block.name = chunk.name;
+          open.set(index, {
+            type: String(chunk.blockType ?? 'text'),
+            text: '',
+            args: '',
+            id: undefined,
+            name: undefined,
+          });
+        } else if ((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') && index !== undefined) {
+          const block = open.get(index);
+          const added = chunk.text ?? '';
+          if (block !== undefined) block.text += added;
+          if (chunk.type === 'text-delta') text += added;
+          spent += added.length;
+        } else if (chunk.type === 'tool-call-delta' && index !== undefined) {
+          const block = open.get(index);
+          const added = chunk.argumentsDelta ?? '';
+          if (block !== undefined) {
+            block.args += added;
+            if (typeof chunk.id === 'string' && chunk.id.length > 0) block.id = chunk.id;
+            if (typeof chunk.name === 'string' && chunk.name.length > 0) block.name = chunk.name;
+          }
+          spent += added.length;
+        } else if (chunk.type === 'block-end' && index !== undefined) {
+          open.delete(index);
+        } else if (chunk.type === 'finish') {
+          finished = true;
+          const code = failureCodeOf(chunk.reason);
+          if (code !== undefined && !NEVER_RETRY.has(code) && produced) {
+            // Output already reached the caller; a retry would duplicate it.
+            const pending = [...open.values()];
+            const hadToolCall = pending.some((block) => block.type === 'tool-call');
+            logger?.warn?.(
+              `tool-call-repair: ${code} after output; closing ${pending.length} block(s) as ${hadToolCall ? 'tool-calls' : 'max-tokens'}`,
+            );
+            for (const closing of openBlocks(open, toolFix)) yield shift(closing);
+            yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
+            return;
+          }
+          if (open.size > 0) {
+            logger?.warn?.(`tool-call-repair: closing ${open.size} unpaired block(s) before finish`);
+            for (const closing of openBlocks(open, toolFix)) yield shift(closing);
+          }
+          truncated = chunk.reason?.kind === 'max-tokens';
         }
-        spent += added.length;
-      } else if (chunk.type === 'block-end' && index !== undefined) {
-        open.delete(index);
-      } else if (chunk.type === 'finish') {
-        finished = true;
-        const code = failureCodeOf(chunk.reason);
-        if (code !== undefined && !NEVER_RETRY.has(code) && produced) {
-          // Output already reached the caller; a retry would duplicate it.
-          // Close the frame and end the turn instead of failing the task.
-          const pending = [...open.values()];
-          const hadToolCall = pending.some((block) => block.type === 'tool-call');
-          logger?.warn?.(
-            `tool-call-repair: ${code} after output; closing ${pending.length} block(s) as ${hadToolCall ? 'tool-calls' : 'max-tokens'}`,
-          );
-          for (const closing of openBlocks(open, toolFix)) yield closing;
+
+        if (isContentFrame(chunk)) produced = true;
+        if (chunk.type === 'finish') continue;
+        yield shift(chunk);
+
+        if (tokenCap > 0 && spent >= tokenCap) {
+          const closing = openBlocks(open, toolFix);
+          const hadToolCall = closing.some((c) => c.block?.type === 'tool-call');
+          logger?.warn?.(`tool-call-repair: token上限 reached ${spent}/${tokenCap}; truncating the turn`);
+          for (const frame of closing) yield shift(frame);
           yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
           return;
         }
-        if (open.size > 0) {
-          logger?.warn?.(`tool-call-repair: closing ${open.size} unpaired block(s) before finish`);
-          for (const closing of openBlocks(open, toolFix)) yield closing;
-        }
       }
+    } catch (error) {
+      const code = codeOf(error);
+      // Codes that cannot be fixed by closing blocks must reach the caller.
+      if (code === undefined || NEVER_RETRY.has(code)) throw error;
+      // Nothing reached the caller yet: let the retry hook own this attempt.
+      if (!produced) throw error;
 
-      if (isContentFrame(chunk)) produced = true;
-      yield chunk;
+      const pending = [...open.values()];
+      const hadToolCall = pending.some((block) => block.type === 'tool-call');
+      logger?.warn?.(
+        `tool-call-repair: stream broke with ${code}; closing ${pending.length} block(s) ${hadToolCall ? 'as tool-calls' : 'as text'}`,
+      );
 
-      if (tokenCap > 0 && spent >= tokenCap) {
-        const closing = openBlocks(open, toolFix);
-        const hadToolCall = closing.some((c) => c.block?.type === 'tool-call');
-        logger?.warn?.(`tool-call-repair: token上限 reached ${spent}/${tokenCap}; truncating the turn`);
-        for (const frame of closing) yield frame;
-        yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
+      for (const closing of openBlocks(open, toolFix)) yield shift(closing);
+      // tool-calls lets the loop dispatch the broken call: the tool rejects the
+      // malformed arguments, the model reads that error and retries itself.
+      yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
+      return;
+    }
+
+    if (open.size > 0) {
+      logger?.warn?.(`tool-call-repair: stream ended with ${open.size} unpaired block(s)`);
+      for (const closing of openBlocks(open, toolFix)) yield shift(closing);
+    }
+
+    // Continue past the provider's output ceiling instead of ending the turn.
+    if (truncated && autoContinue && round < continueRounds && text !== '') {
+      round += 1;
+      carried += text;
+      offset = topIndex + 1;
+      const messages = Array.isArray(options.messages) ? options.messages : [];
+      try {
+        options.messages = [
+          ...messages,
+          { role: 'assistant', content: [{ type: 'text', text: carried }] },
+          { role: 'user', content: [{ type: 'text', text: '继续' }] },
+        ];
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        logger?.warn?.(`tool-call-repair: auto-continue could not arm; ending as max-tokens (${detail})`);
+        yield { type: 'finish', reason: { kind: 'max-tokens' } };
         return;
       }
+      logger?.warn?.(`tool-call-repair: auto-continue ${round}/${continueRounds}`);
+      continue;
     }
-  } catch (error) {
-    const code = codeOf(error);
-    // Codes that cannot be fixed by closing blocks must reach the caller.
-    if (code === undefined || NEVER_RETRY.has(code)) throw error;
-    // Nothing reached the caller yet: let the retry hook own this attempt.
-    if (!produced) throw error;
 
-    const pending = [...open.values()];
-    const hadToolCall = pending.some((block) => block.type === 'tool-call');
-    logger?.warn?.(`tool-call-repair: stream broke with ${code}; closing ${pending.length} block(s) ${hadToolCall ? 'as tool-calls' : 'as text'}`);
-
-    for (const closing of openBlocks(open, toolFix)) yield closing;
-    // tool-calls lets the loop dispatch the broken call: the tool rejects the
-    // malformed arguments, the model reads that error and retries itself.
-    yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
-    return;
-  }
-
-  if (open.size > 0) {
-    logger?.warn?.(`tool-call-repair: stream ended with ${open.size} unpaired block(s)`);
-    for (const closing of openBlocks(open, toolFix)) yield closing;
     if (!finished) yield { type: 'finish', reason: { kind: 'max-tokens' } };
+    else yield { type: 'finish', reason: { kind: truncated ? 'max-tokens' : 'stop' } };
+    return;
   }
 }
