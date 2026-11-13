@@ -128,11 +128,11 @@ export const Config = z.object({
   工具修复: z.boolean().default(true).description('流层协议修复：补发缺失的 block-end，按 tool-calls 收尾并派发被截断的调用').volatile(),
   重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试').volatile(),
   token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预').volatile(),
-  maxRetriesPerTurn: z.natural().default(40),
-  codes: z.array(z.string()).default(['*']),
-  initialDelayMs: z.natural().default(1000),
-  maxDelayMs: z.natural().default(240000),
-  jitterRatio: z.number().min(0).max(1).default(0.2),
+  maxRetriesPerTurn: z.natural().default(40).description('每个 turn 加 step 的重试总预算').volatile(),
+  codes: z.array(z.string()).default(['*']).description('参与重试的失败码，* 表示全部').volatile(),
+  initialDelayMs: z.natural().default(1000).description('首次退避毫秒，之后指数翻倍').volatile(),
+  maxDelayMs: z.natural().default(240000).description('单次退避上限毫秒').volatile(),
+  jitterRatio: z.number().min(0).max(1).default(0.2).description('退避抖动比例，0 到 1').volatile(),
 });
 
 interface ResolvedConfig {
@@ -297,58 +297,72 @@ function isContentFrame(chunk: StreamChunk): boolean {
 export const name = 'tool-call-repair';
 
 export function apply(ctx: PluginContext, config?: ConfigShape): void {
-  const options = normalize(config);
+  // Volatile fields can change while the plugin stays mounted, so options are
+  // re-read per request rather than captured once at mount.
+  const read = (): ResolvedConfig => normalize(config);
   const logger = ctx.logger;
   const steps = new WeakMap<object, StepBudget>();
   const turns = new WeakMap<object, TurnBudget>();
 
-  if (options.toolFix) {
-    ctx.on('llm/stream', (_options, next) => repair(next(), logger, options.tokenCap, options.toolFix));
-  }
+  // Registered unconditionally: 工具修复 may be switched on after mount.
+  ctx.on('llm/stream', (_options, next) => {
+    const live = read();
+    if (!live.toolFix) return next();
+    return repair(next(), logger, live.tokenCap, live.toolFix);
+  });
 
-  function takeBudget(agent: object, turn: number | undefined, step: number | undefined): number | undefined {
+  function takeBudget(
+    live: ResolvedConfig,
+    agent: object,
+    turn: number | undefined,
+    step: number | undefined,
+  ): number | undefined {
     let turnRecord = turns.get(agent);
     if (turnRecord === undefined || turnRecord.turn !== turn) {
       turnRecord = { turn, used: 0 };
       turns.set(agent, turnRecord);
     }
-    if (turnRecord.used >= options.maxRetriesPerTurn) return undefined;
+    if (turnRecord.used >= live.retriesPerTurn) return undefined;
 
     let stepRecord = steps.get(agent);
     if (stepRecord === undefined || stepRecord.turn !== turn || stepRecord.step !== step) {
       stepRecord = { turn, step, used: 0 };
       steps.set(agent, stepRecord);
     }
-    if (stepRecord.used >= options.retries) return undefined;
+    if (stepRecord.used >= live.retries) return undefined;
 
     stepRecord.used += 1;
     turnRecord.used += 1;
     return stepRecord.used;
   }
 
-  if (options.retries > 0) ctx.on('agent/request-error', async (payload, next) => {
+  // Also unconditional: 重试次数 may be raised from 0 after mount.
+  ctx.on('agent/request-error', async (payload, next) => {
     const downstream = await next();
     if (downstream !== undefined && downstream !== null) return downstream;
 
     try {
+      const live = read();
+      if (live.retries <= 0) return downstream;
+
       const failure = payload?.failure;
       if (!failure) return downstream;
       const code = failure.code;
-      if (code === undefined || !eligible(options, code)) return downstream;
+      if (code === undefined || !eligible(live, code)) return downstream;
       if (payload.signal?.aborted) return downstream;
 
       const agent = payload.agent;
       if (!agent) return downstream;
 
-      const attempt = takeBudget(agent, payload.turn, payload.step);
+      const attempt = takeBudget(live, agent, payload.turn, payload.step);
       if (attempt === undefined) {
         logger?.warn?.(`tool-call-repair: budget spent for ${code} on turn ${payload.turn} step ${payload.step}`);
         return downstream;
       }
 
-      const capped = Math.min(options.initialDelayMs * 2 ** (attempt - 1), options.maxDelayMs);
-      const jitter = 1 - options.jitterRatio + 2 * options.jitterRatio * Math.random();
-      const delayMs = Math.round(Math.min(capped * jitter, options.maxDelayMs));
+      const capped = Math.min(live.initialDelayMs * 2 ** (attempt - 1), live.maxDelayMs);
+      const jitter = 1 - live.jitterRatio + 2 * live.jitterRatio * Math.random();
+      const delayMs = Math.round(Math.min(capped * jitter, live.maxDelayMs));
 
       logger?.warn?.(
         `tool-call-repair: attempt ${attempt} for ${code} on turn ${payload.turn} step ${payload.step} in ${delayMs}ms`,
