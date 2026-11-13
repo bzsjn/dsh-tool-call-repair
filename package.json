@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-call-repair",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Keeps a turn alive when a model request fails recoverably: any failure code is retried with exponential backoff under a bounded budget, so transient gateway faults (truncated tool arguments, empty completions, early stream ends) do not end the task. Toggleable from the plugin manager.",
   "type": "module",
   "main": "lib/index.js",
