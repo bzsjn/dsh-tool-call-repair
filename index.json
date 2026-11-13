@@ -1,0 +1,117 @@
+{
+  "format": 1,
+  "title": {
+    "en": "BZSJN DSH plugins",
+    "zh": "BZSJN DSH 插件源"
+  },
+  "description": {
+    "en": "Verified DSH bundles published from github.com/bzsjn: recoverable model-request retry and stream repair.",
+    "zh": "来自 github.com/bzsjn 的已校验 DSH 插件：模型请求可恢复故障重试与流式修复。"
+  },
+  "metadata": {
+    "categories": {
+      "reliability": {
+        "title": {
+          "en": "Reliability",
+          "zh": "稳定性"
+        }
+      }
+    },
+    "labels": {},
+    "sortKeys": {}
+  },
+  "plugins": [
+    {
+      "name": "dsh-tool-call-repair",
+      "title": {
+        "en": "dsh-tool-call-repair",
+        "zh": "dsh-tool-call-repair"
+      },
+      "description": {
+        "en": "Keeps a turn alive when a model request fails recoverably: any failure code is retried with exponential backoff under a bounded budget, so transient gateway faults (truncated tool arguments, empty completions, early stream ends) do not end the task. Toggleable from the plugin manager."
+      },
+      "icon": "icon.svg",
+      "author": "bzsjn",
+      "homepage": "https://github.com/bzsjn/dsh-tool-call-repair#readme",
+      "repository": {
+        "url": "https://github.com/bzsjn/dsh-tool-call-repair"
+      },
+      "metadata": {
+        "category": "reliability",
+        "keywords": [
+          "dsh",
+          "deepseek-harness",
+          "plugin",
+          "bundle",
+          "tool-call",
+          "retry",
+          "malformed-response"
+        ],
+        "labels": [],
+        "sortKeys": {}
+      },
+      "versions": [
+        {
+          "version": "0.4.2",
+          "publishTimestamp": 1794531789,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/bzsjn/dsh-tool-call-repair",
+            "commit": "31a299b46176b86394ce7acd8db459cf93517815"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.1 <0.3.0"
+          }
+        },
+        {
+          "version": "0.4.1",
+          "publishTimestamp": 1794530651,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/bzsjn/dsh-tool-call-repair",
+            "commit": "9e01ec2ea382528805513254338247499b975488"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.1 <0.3.0"
+          }
+        },
+        {
+          "version": "0.4.0",
+          "publishTimestamp": 1794527822,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/bzsjn/dsh-tool-call-repair",
+            "commit": "f811ea130cf621ca4953b0a07ad38b695cf01432"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.1 <0.3.0"
+          }
+        },
+        {
+          "version": "0.3.0",
+          "publishTimestamp": 1794492802,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/bzsjn/dsh-tool-call-repair",
+            "commit": "231d0d7c4cf452ace99bb95e32d28737aeed3d2a"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.1 <0.3.0"
+          }
+        },
+        {
+          "version": "0.2.0",
+          "publishTimestamp": 1794485428,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/bzsjn/dsh-tool-call-repair",
+            "commit": "5b32f26483c6f081599a1ea958e2fb00c153660e"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.1 <0.3.0"
+          }
+        }
+      ]
+    }
+  ]
+}

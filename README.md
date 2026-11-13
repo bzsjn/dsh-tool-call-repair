@@ -124,3 +124,45 @@ tool-call-repair: budget spent for MALFORMED_RESPONSE on turn 3 step 5
 单次工具执行失败本身在 `dsh-tools` 里已降级成 tool_result 错误回给模型，不会终止任务。
 
 根治仍在上游：换直连通道或原生 `dsh-llm-deepseek`，比客户端兜底干净。
+
+## 从插件市场安装
+
+`index.json` 是本仓库的插件市场索引（format 1）。DSH 里走这条路装，比手抄 `github:` spec 稳：
+
+1. 设置 → 插件 → 实验性插件 → 更多 → 启用「自定义插件市场」，重启 DSH。
+2. 发现 → 添加索引源，粘贴：
+
+```
+https://bzsjn.github.io/dsh-tool-call-repair/index.json
+```
+
+3. 列表里选 `dsh-tool-call-repair`，核对来源 `github.com/bzsjn/dsh-tool-call-repair`、包名
+   `dsh-tool-call-repair`，确认安装。
+
+索引里每个版本都钉到 commit，`0.4.2` 就是
+`git+https://github.com/bzsjn/dsh-tool-call-repair.git#31a299b46176b86394ce7acd8db459cf93517815`。
+`engines.dsh` 为 `>=0.2.1-rc.1 <0.3.0`，不匹配的 DSH 版本不会出现在可选列表里。
+
+## 发布索引
+
+`index.json` 由 `scripts/build-index.mjs` 从 git tag 生成：**tag 即版本，commit 时间即
+`publishTimestamp`**。所以要发新版本，先改 `package.json` 的 `version`、打 tag、推 tag。
+
+```powershell
+node scripts/build-index.mjs          # 生成 index.json
+node scripts/build-index.mjs --check  # 只做格式自检
+```
+
+GitHub Pages 一次性设置：仓库 Settings → Pages → Source 选 **GitHub Actions**。
+之后 push tag 或 main，`.github/workflows/publish-index.yml` 会用 `fetch-depth: 0` 拉全量
+tag、重建索引、发布 `index.json` + `icon.svg` 到 Pages。
+
+带 DSH 自带验证器的深校验（格式错会指出 JSON path）：
+
+```powershell
+$env:DSH_PLUGIN_MARKET_INDEX = '<DSH>/resources/app/node_modules/@deepseek-ai/dsh-plugin-market-index/lib/index.js'
+node scripts/validate-index.mjs
+```
+
+本地先试再发布：仓库根起静态服务（`python -m http.server 8080`），索引源填
+`http://127.0.0.1:8080/index.json`。索引允许 http，相对 `icon.svg` 按同源解析。
