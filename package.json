@@ -46,6 +46,9 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.19.0"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.1.0"
   },
