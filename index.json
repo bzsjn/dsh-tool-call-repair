@@ -52,6 +52,18 @@
       },
       "versions": [
         {
+          "version": "0.4.8",
+          "publishTimestamp": 1794908960,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/bzsjn/dsh-tool-call-repair",
+            "commit": "5d9a02d4f0256962827bae8d47c1753fd3b806e1"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.1 <0.3.0"
+          }
+        },
+        {
           "version": "0.4.7",
           "publishTimestamp": 1794548385,
           "source": {
