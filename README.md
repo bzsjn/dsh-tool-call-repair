@@ -14,6 +14,14 @@
 
 这些是链路抖动，不是确定性 bug，重试即可恢复。
 
+还有两类「不报错但也没结果」的故障，客户端不兜就永远看不到提示：
+
+- 上游把输出预算烧在 thinking 上，正文退化成空或只有一个空格，却以 `end_turn` 正常收尾；
+  DSH 的 `preview()` 会 `trim()` 掉空白，于是这一轮被判定为「已完成」而正文为空
+- 撞上输出上限（或断流时已写了正文）后，`自动续写` 需要把已产出文本回填进请求；
+  DSH 传给 `llm/stream` 的 options 是只读对象，`options.messages = [...]` 会抛
+  `Cannot assign to read only property 'messages'`，续写静默失败，界面只剩「已达到输出 token 上限」
+
 ## 策略
 
 挂在 `agent/request-error` waterfall 上：
@@ -43,13 +51,17 @@
 
 降级后：带工具调用则结束为 `tool-calls`，工具拿到残缺参数 schema 失败、错误回给模型、模型自行重写；纯文本则结束为 `max-tokens`，本轮收尾、下一条继续。两种情况都不会死会话。
 
-## 三个开关
+## 开关
 
 `cordis.patch.yml`：
 
 ```yaml
 config:
   工具修复: true
+  自动续写: true
+  续写轮数: 3
+  空响应修复: true
+  空响应次数: 3
   重试次数: 12
   token上限: 0
   maxRetriesPerTurn: 40
@@ -62,6 +74,10 @@ config:
 | 开关 | 作用 | 关闭时 |
 |---|---|---|
 | `工具修复` | 流层补发缺失的 `block-end`，把截断的 tool call 按 `tool-calls` 收尾并派发，模型读到参数错误后重写 | 不接管流，截断会照原样失败 |
+| `自动续写` | 撞上输出上限、或断流时已经写了正文，就带着已产出文本再发一轮接着写 | 直接按截断收尾，要手动「继续」 |
+| `续写轮数` | 自动续写的最大轮数，到顶即按截断收尾 | `0` 等于关闭续写 |
+| `空响应修复` | 流正常结束但既没有正文、也没有工具调用时，合成 `EMPTY_RESPONSE` 交给重试层，而不是静默完成 | 空响应照原样结束，界面显示「已完成」但正文为空 |
+| `空响应次数` | 连续空响应的重试上限 | `0` 不重试空响应 |
 | `重试次数` | 模型请求失败的重试上限。覆盖 `TRANSPORT`、`SERVER`、`TIMEOUT`、`RATE_LIMIT`、`EMPTY_RESPONSE`、`MALFORMED_RESPONSE` | `0` 完全不注册重试层 |
 | `token上限` | 本轮输出字符预算，达到即补 `block-end` 并按截断收尾 | `0` 不干预，交给服务端 |
 
@@ -110,11 +126,22 @@ profile 的 `cordis.patch.yml` 不再写 mount 行，避免双挂载。
 
 ## 验证
 
+回归套件（跑的是 `lib/index.js`，即 DSH 实际加载的产物）：
+
+```bash
+node tests/stream-repair.mjs
+```
+
+8 条断言：空响应转 `EMPTY_RESPONSE`、纯空格正文算空响应、max-tokens 续写在只读 options 上成功、
+断流后自动续写、工具调用不被改写、开关全关时透传、数组冻结时降级、空响应预算用尽后放行。
+
 日志判据：
 
 ```
 tool-call-repair: attempt 1 for MALFORMED_RESPONSE on turn 3 step 5 in 250ms
 tool-call-repair: budget spent for MALFORMED_RESPONSE on turn 3 step 5
+tool-call-repair: empty response 1/3; retrying
+tool-call-repair: auto-continue 1/3
 ```
 
 ## 边界

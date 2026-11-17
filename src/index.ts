@@ -38,6 +38,22 @@ interface ConfigShape {
   '重试次数'?: number;
   /** token上限：本轮输出达到该值即按截断收尾，0 表示不干预。 */
   'token上限'?: number;
+  /** 自动续写：达到输出上限后自动再发一次请求接着写。 */
+  '自动续写'?: boolean;
+  /** 续写轮数：自动续写的最大轮数。 */
+  '续写轮数'?: number;
+  /** Continue the answer after the provider's output ceiling. */
+  autoContinue?: boolean;
+  /** How many continuation rounds are allowed. */
+  continueRounds?: number;
+  /** 空响应修复：流正常结束但没有正文也没有工具调用时，按可重试错误处理。 */
+  '空响应修复'?: boolean;
+  /** 空响应次数：连续空响应的重试上限，0 表示不重试。 */
+  '空响应次数'?: number;
+  /** Retry a completion that carried neither text nor tool calls. */
+  repairEmptyResponse?: boolean;
+  /** How many consecutive empty completions may be retried. */
+  emptyResponseRetries?: number;
   /** Retries allowed per turn+step. `0` disables retrying. */
   maxRetries?: number;
   /** Retries allowed across one whole turn. */
@@ -121,6 +137,8 @@ const DEFAULTS = {
   initialDelayMs: 1000,
   maxDelayMs: 240000,
   jitterRatio: 0.2,
+  emptyResponse: true,
+  emptyRetries: 3,
   autoContinue: false,
   continueRounds: 3,
 };
@@ -132,6 +150,8 @@ export const Config = z.object({
   续写轮数: z.natural().default(3).description('自动续写的最大轮数，到顶即按截断收尾').volatile(),
   重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试').volatile(),
   token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预').volatile(),
+  空响应修复: z.boolean().default(true).description('流正常结束但没有正文也没有工具调用时，当作可重试错误重发，而不是静默完成').volatile(),
+  空响应次数: z.natural().default(3).description('连续空响应的重试上限，0 表示不重试').volatile(),
   maxRetriesPerTurn: z.natural().default(40).description('每个 turn 加 step 的重试总预算').volatile(),
   codes: z.array(z.string()).default(['*']).description('参与重试的失败码，* 表示全部').volatile(),
   initialDelayMs: z.natural().default(1000).description('首次退避毫秒，之后指数翻倍').volatile(),
@@ -147,6 +167,10 @@ interface ResolvedConfig {
   retriesPerTurn: number;
   /** token上限 */
   tokenCap: number;
+  /** 空响应修复 */
+  emptyResponse: boolean;
+  /** 空响应次数 */
+  emptyRetries: number;
   /** 自动续写 */
   autoContinue: boolean;
   /** 续写轮数 */
@@ -216,6 +240,14 @@ function normalize(config?: ConfigShape): ResolvedConfig {
 
   const tokenCap = Math.floor(positive(raw['token上限'], 0));
 
+  const emptyResponse =
+    raw['空响应修复'] !== undefined
+      ? raw['空响应修复'] === true
+      : raw.repairEmptyResponse !== false;
+  const emptyRetries = Math.floor(
+    positive(raw['空响应次数'] ?? raw.emptyResponseRetries, DEFAULTS.emptyRetries),
+  );
+
   const autoContinue =
     raw['自动续写'] !== undefined ? raw['自动续写'] === true : raw.autoContinue === true;
   const continueRounds = Math.floor(
@@ -227,6 +259,8 @@ function normalize(config?: ConfigShape): ResolvedConfig {
     retries,
     retriesPerTurn: Math.floor(positive(raw.maxRetriesPerTurn, DEFAULTS.maxRetriesPerTurn)),
     tokenCap,
+    emptyResponse,
+    emptyRetries,
     autoContinue,
     continueRounds,
     anyCode: codes.includes('*'),
@@ -323,8 +357,8 @@ export function apply(ctx: PluginContext, config?: ConfigShape): void {
   // Registered unconditionally: 工具修复 and 自动续写 may be switched on after mount.
   ctx.on('llm/stream', (options, next) => {
     const live = read();
-    if (!live.toolFix && !live.autoContinue) return next();
-    return repair(next, options, logger, live);
+    if (!live.toolFix && !live.autoContinue && !live.emptyResponse) return next();
+    return repair(next, options as StreamRequest, logger, live);
   });
 
   function takeBudget(
@@ -399,6 +433,34 @@ interface StreamRequest {
   messages?: unknown[];
 }
 
+/** Timers come from the host runtime; the package ships no Node type deps. */
+declare function setTimeout(handler: () => void, timeout?: number): unknown;
+declare function clearTimeout(handle: unknown): void;
+
+/**
+ * Consecutive empty completions, tracked across repair() calls because every
+ * retry builds a fresh stream. Reset on any real answer, and after a quiet gap
+ * so a later, unrelated turn is not punished for an old streak.
+ */
+const EMPTY_STREAK = { count: 0, at: 0 };
+const EMPTY_STREAK_WINDOW_MS = 120000;
+
+function emptyStreak(): number {
+  if (Date.now() - EMPTY_STREAK.at > EMPTY_STREAK_WINDOW_MS) EMPTY_STREAK.count = 0;
+  return EMPTY_STREAK.count;
+}
+
+function bumpEmptyStreak(): number {
+  EMPTY_STREAK.count += 1;
+  EMPTY_STREAK.at = Date.now();
+  return EMPTY_STREAK.count;
+}
+
+function resetEmptyStreak(): void {
+  EMPTY_STREAK.count = 0;
+  EMPTY_STREAK.at = 0;
+}
+
 /** Wrap one model stream so a truncated frame cannot leave the turn half-open. */
 async function* repair(
   next: () => AsyncIterable<StreamChunk>,
@@ -406,18 +468,39 @@ async function* repair(
   logger: Logger | undefined,
   live: ResolvedConfig,
 ): AsyncGenerator<StreamChunk> {
-  const { tokenCap, toolFix, autoContinue, continueRounds } = live;
+  const { tokenCap, toolFix, autoContinue, continueRounds, emptyResponse, emptyRetries } = live;
   let round = 0;
   let offset = 0;
   let spent = 0;
   let produced = false;
   let carried = '';
 
+  /**
+   * Append the continuation turn to the request that `next()` will re-issue.
+   * DSH hands this waterfall a read-only options object, so assign would throw;
+   * the messages array itself stays writable, so push in place.
+   */
+  const armContinuation = (): boolean => {
+    const messages = Array.isArray(options.messages) ? options.messages : [];
+    try {
+      messages.push(
+        { role: 'assistant', content: [{ type: 'text', text: carried }] },
+        { role: 'user', content: [{ type: 'text', text: '继续' }] },
+      );
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logger?.warn?.(`tool-call-repair: auto-continue could not arm (${detail})`);
+      return false;
+    }
+  };
+
   for (;;) {
     const open = new Map<number, OpenBlock>();
     let finished = false;
     let truncated = false;
     let text = '';
+    let sawToolCall = false;
     let topIndex = -1;
     const shift = (chunk: StreamChunk): StreamChunk =>
       offset === 0 || typeof chunk.index !== 'number' ? chunk : { ...chunk, index: chunk.index + offset };
@@ -432,6 +515,7 @@ async function* repair(
         if (index !== undefined && index > topIndex) topIndex = index;
 
       if (chunk.type === 'block-start' && index !== undefined) {
+          if (String(chunk.blockType ?? 'text') === 'tool-call') sawToolCall = true;
           open.set(index, {
             type: String(chunk.blockType ?? 'text'),
             text: '',
@@ -504,6 +588,19 @@ async function* repair(
       );
 
       for (const closing of openBlocks(open, toolFix)) yield shift(closing);
+
+      // A broken stream that already wrote text is a cut-off answer, not a
+      // token cap. Continue it when the caller asked for that.
+      if (!hadToolCall && autoContinue && round < continueRounds && text !== '') {
+        round += 1;
+        carried += text;
+        offset = topIndex + 1;
+        if (armContinuation()) {
+          logger?.warn?.(`tool-call-repair: auto-continue ${round}/${continueRounds} after ${code}`);
+          continue;
+        }
+      }
+
       // tool-calls lets the loop dispatch the broken call: the tool rejects the
       // malformed arguments, the model reads that error and retries itself.
       yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
@@ -515,21 +612,27 @@ async function* repair(
       for (const closing of openBlocks(open, toolFix)) yield shift(closing);
     }
 
+    // A completion that carried neither text nor a tool call is not an answer.
+    // Report it as a retryable failure instead of letting the loop call it done.
+    if (finished && !truncated && emptyResponse && text.trim() === '' && !sawToolCall) {
+      const streak = bumpEmptyStreak();
+      if (streak <= emptyRetries) {
+        logger?.warn?.(`tool-call-repair: empty response ${streak}/${emptyRetries}; retrying`);
+        yield { type: 'finish', reason: { kind: 'error', failure: { code: 'EMPTY_RESPONSE' } } };
+        return;
+      }
+      logger?.warn?.(
+        `tool-call-repair: empty response budget spent (${streak}/${emptyRetries}); ending as stop`,
+      );
+    }
+    if (text.trim() !== '' || sawToolCall) resetEmptyStreak();
+
     // Continue past the provider's output ceiling instead of ending the turn.
     if (truncated && autoContinue && round < continueRounds && text !== '') {
       round += 1;
       carried += text;
       offset = topIndex + 1;
-      const messages = Array.isArray(options.messages) ? options.messages : [];
-      try {
-        options.messages = [
-          ...messages,
-          { role: 'assistant', content: [{ type: 'text', text: carried }] },
-          { role: 'user', content: [{ type: 'text', text: '继续' }] },
-        ];
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        logger?.warn?.(`tool-call-repair: auto-continue could not arm; ending as max-tokens (${detail})`);
+      if (!armContinuation()) {
         yield { type: 'finish', reason: { kind: 'max-tokens' } };
         return;
       }

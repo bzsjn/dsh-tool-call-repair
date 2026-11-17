@@ -17,6 +17,8 @@
       name: 'dsh-tool-call-repair'
       config:
         工具修复: true
+        空响应修复: true
+        空响应次数: 3
         重试次数: 12
         token上限: 0
         maxRetriesPerTurn: 40
