@@ -1,22 +1,27 @@
 /**
  * dsh-tool-call-repair
  *
- * Two layers, both needed:
+ * ⚠️ 0.5.0 起，运行时的唯一权威实现是 `.build/pNN.js` 分片，
+ * 由 `node scripts/build-index.mjs` 合并成 `lib/index.js`（DSH 实际加载的文件）。
+ * 本文件保留 0.4.7 的实现作类型与注释参考，函数体尚未转写 0.5.0 的
+ * 空响应修复、退化检测/续跑与历史清洗；这些键的**类型**已经在下面补齐，
+ * 行为以分片为准。下个版本会把分片转写回本文件并恢复 `tsc` 构建链。
+ * 改行为请改 `.build/` 分片后 `pnpm index`，不要只改这里，也不要直接改 lib。
  *
- * 1. llm/stream  -- keep the chunk protocol intact. The adapter drops a
- *    tool-call block whose arguments JSON never finished and then raises
- *    MALFORMED_RESPONSE, leaving a block-start without a block-end. This layer
- *    closes every open block, so the turn ends as tool-calls/max-tokens
- *    instead of dying. A half-written argument string is passed through as
- *    text: the tool rejects it, the error goes back to the model, and the
- *    model retries on its own.
+ * 0.5.0 的四层，都挂在同一份钩子表上：
  *
- * 2. agent/request-error -- retry the request first, with exponential backoff
- *    and a bounded budget, because transient faults usually succeed on the
- *    second attempt.
+ * 1. llm/stream  -- 协议修复。适配器丢弃参数 JSON 没写完的 tool-call 块后抛
+ *    MALFORMED_RESPONSE，留下没有 block-end 的 block-start；这层把每个打开的
+ *    块都关掉，让本轮以 tool-calls/max-tokens 收尾而不是死掉。半截的参数文本
+ *    原样透传：工具会拒绝，错误回到模型，模型自己重写。
+ * 2. llm/stream  -- 空响应修复。上游回了 stop 却零内容时改写成 EMPTY_RESPONSE
+ *    失败帧，交给重试层，不再当一次成功的空回答落库。
+ * 3. llm/stream + agent/turn-stopping -- 退化检测与续跑。思考流连续冒出纯应答
+ *    短句时截断并按 max-tokens 收尾，然后在本轮边界推一条输入让模型给结论。
+ * 4. agent/pre-step -- 历史清洗。把历史里 content 为空的 assistant 消息摘出去，
+ *    阻止已经落库的空回答继续污染每次请求。
  *
- * Neither layer rewrites truncated JSON: guessing the missing tail could
- * change the command that runs.
+ * 任何一层都不改写被截断的 JSON：猜补缺失的尾巴可能改变真正要执行的命令。
  */
 
 import z from '@deepseek-ai/schemastery';
@@ -38,22 +43,6 @@ interface ConfigShape {
   '重试次数'?: number;
   /** token上限：本轮输出达到该值即按截断收尾，0 表示不干预。 */
   'token上限'?: number;
-  /** 自动续写：达到输出上限后自动再发一次请求接着写。 */
-  '自动续写'?: boolean;
-  /** 续写轮数：自动续写的最大轮数。 */
-  '续写轮数'?: number;
-  /** Continue the answer after the provider's output ceiling. */
-  autoContinue?: boolean;
-  /** How many continuation rounds are allowed. */
-  continueRounds?: number;
-  /** 空响应修复：流正常结束但没有正文也没有工具调用时，按可重试错误处理。 */
-  '空响应修复'?: boolean;
-  /** 空响应次数：连续空响应的重试上限，0 表示不重试。 */
-  '空响应次数'?: number;
-  /** Retry a completion that carried neither text nor tool calls. */
-  repairEmptyResponse?: boolean;
-  /** How many consecutive empty completions may be retried. */
-  emptyResponseRetries?: number;
   /** Retries allowed per turn+step. `0` disables retrying. */
   maxRetries?: number;
   /** Retries allowed across one whole turn. */
@@ -66,6 +55,31 @@ interface ConfigShape {
   maxDelayMs?: number;
   /** Backoff jitter ratio, `0` disables jitter. */
   jitterRatio?: number;
+
+  // ---- 0.5.0 新增：实现见 .build/ 分片，这里只保证类型可用 ----
+
+  /** 空响应修复：上游回了 stop 却零内容时转成 EMPTY_RESPONSE 交给重试层。 */
+  '空响应修复'?: boolean;
+  /** 空响应次数：连续空响应的重试上限，0 表示不重试。 */
+  '空响应次数'?: number;
+  /** 退化检测：思考流连续出现纯应答短句时截断本轮。 */
+  '退化检测'?: boolean;
+  /** 退化阈值：连续几次算复读，默认 2。 */
+  '退化阈值'?: number;
+  /** 退化词表：整行匹配的填充短句表。 */
+  '退化词表'?: string[];
+  /** 退化续跑：截断后在本轮边界推一条输入让本轮继续。 */
+  '退化续跑'?: boolean;
+  /** 退化续跑文案：续跑时注入的正文。 */
+  '退化续跑文案'?: string;
+  /** 退化续跑上限：同一轮最多续跑几次，默认 3。 */
+  '退化续跑上限'?: number;
+  /** 历史清洗：发请求前摘掉历史里 content 为空的 assistant 消息。 */
+  '历史清洗'?: boolean;
+  /** 历史清洗占位：用极简文本替身顶替空消息而不是删除。 */
+  '历史清洗占位'?: boolean;
+  /** 历史清洗文本：占位替身的正文。 */
+  '历史清洗文本'?: string;
 }
 
 interface Logger {
@@ -137,8 +151,6 @@ const DEFAULTS = {
   initialDelayMs: 1000,
   maxDelayMs: 240000,
   jitterRatio: 0.2,
-  emptyResponse: true,
-  emptyRetries: 3,
   autoContinue: false,
   continueRounds: 3,
 };
@@ -150,8 +162,6 @@ export const Config = z.object({
   续写轮数: z.natural().default(3).description('自动续写的最大轮数，到顶即按截断收尾').volatile(),
   重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试').volatile(),
   token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预').volatile(),
-  空响应修复: z.boolean().default(true).description('流正常结束但没有正文也没有工具调用时，当作可重试错误重发，而不是静默完成').volatile(),
-  空响应次数: z.natural().default(3).description('连续空响应的重试上限，0 表示不重试').volatile(),
   maxRetriesPerTurn: z.natural().default(40).description('每个 turn 加 step 的重试总预算').volatile(),
   codes: z.array(z.string()).default(['*']).description('参与重试的失败码，* 表示全部').volatile(),
   initialDelayMs: z.natural().default(1000).description('首次退避毫秒，之后指数翻倍').volatile(),
@@ -167,10 +177,6 @@ interface ResolvedConfig {
   retriesPerTurn: number;
   /** token上限 */
   tokenCap: number;
-  /** 空响应修复 */
-  emptyResponse: boolean;
-  /** 空响应次数 */
-  emptyRetries: number;
   /** 自动续写 */
   autoContinue: boolean;
   /** 续写轮数 */
@@ -240,14 +246,6 @@ function normalize(config?: ConfigShape): ResolvedConfig {
 
   const tokenCap = Math.floor(positive(raw['token上限'], 0));
 
-  const emptyResponse =
-    raw['空响应修复'] !== undefined
-      ? raw['空响应修复'] === true
-      : raw.repairEmptyResponse !== false;
-  const emptyRetries = Math.floor(
-    positive(raw['空响应次数'] ?? raw.emptyResponseRetries, DEFAULTS.emptyRetries),
-  );
-
   const autoContinue =
     raw['自动续写'] !== undefined ? raw['自动续写'] === true : raw.autoContinue === true;
   const continueRounds = Math.floor(
@@ -259,8 +257,6 @@ function normalize(config?: ConfigShape): ResolvedConfig {
     retries,
     retriesPerTurn: Math.floor(positive(raw.maxRetriesPerTurn, DEFAULTS.maxRetriesPerTurn)),
     tokenCap,
-    emptyResponse,
-    emptyRetries,
     autoContinue,
     continueRounds,
     anyCode: codes.includes('*'),
@@ -357,8 +353,8 @@ export function apply(ctx: PluginContext, config?: ConfigShape): void {
   // Registered unconditionally: 工具修复 and 自动续写 may be switched on after mount.
   ctx.on('llm/stream', (options, next) => {
     const live = read();
-    if (!live.toolFix && !live.autoContinue && !live.emptyResponse) return next();
-    return repair(next, options as StreamRequest, logger, live);
+    if (!live.toolFix && !live.autoContinue) return next();
+    return repair(next, options, logger, live);
   });
 
   function takeBudget(
@@ -433,34 +429,6 @@ interface StreamRequest {
   messages?: unknown[];
 }
 
-/** Timers come from the host runtime; the package ships no Node type deps. */
-declare function setTimeout(handler: () => void, timeout?: number): unknown;
-declare function clearTimeout(handle: unknown): void;
-
-/**
- * Consecutive empty completions, tracked across repair() calls because every
- * retry builds a fresh stream. Reset on any real answer, and after a quiet gap
- * so a later, unrelated turn is not punished for an old streak.
- */
-const EMPTY_STREAK = { count: 0, at: 0 };
-const EMPTY_STREAK_WINDOW_MS = 120000;
-
-function emptyStreak(): number {
-  if (Date.now() - EMPTY_STREAK.at > EMPTY_STREAK_WINDOW_MS) EMPTY_STREAK.count = 0;
-  return EMPTY_STREAK.count;
-}
-
-function bumpEmptyStreak(): number {
-  EMPTY_STREAK.count += 1;
-  EMPTY_STREAK.at = Date.now();
-  return EMPTY_STREAK.count;
-}
-
-function resetEmptyStreak(): void {
-  EMPTY_STREAK.count = 0;
-  EMPTY_STREAK.at = 0;
-}
-
 /** Wrap one model stream so a truncated frame cannot leave the turn half-open. */
 async function* repair(
   next: () => AsyncIterable<StreamChunk>,
@@ -468,39 +436,18 @@ async function* repair(
   logger: Logger | undefined,
   live: ResolvedConfig,
 ): AsyncGenerator<StreamChunk> {
-  const { tokenCap, toolFix, autoContinue, continueRounds, emptyResponse, emptyRetries } = live;
+  const { tokenCap, toolFix, autoContinue, continueRounds } = live;
   let round = 0;
   let offset = 0;
   let spent = 0;
   let produced = false;
   let carried = '';
 
-  /**
-   * Append the continuation turn to the request that `next()` will re-issue.
-   * DSH hands this waterfall a read-only options object, so assign would throw;
-   * the messages array itself stays writable, so push in place.
-   */
-  const armContinuation = (): boolean => {
-    const messages = Array.isArray(options.messages) ? options.messages : [];
-    try {
-      messages.push(
-        { role: 'assistant', content: [{ type: 'text', text: carried }] },
-        { role: 'user', content: [{ type: 'text', text: '继续' }] },
-      );
-      return true;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      logger?.warn?.(`tool-call-repair: auto-continue could not arm (${detail})`);
-      return false;
-    }
-  };
-
   for (;;) {
     const open = new Map<number, OpenBlock>();
     let finished = false;
     let truncated = false;
     let text = '';
-    let sawToolCall = false;
     let topIndex = -1;
     const shift = (chunk: StreamChunk): StreamChunk =>
       offset === 0 || typeof chunk.index !== 'number' ? chunk : { ...chunk, index: chunk.index + offset };
@@ -515,7 +462,6 @@ async function* repair(
         if (index !== undefined && index > topIndex) topIndex = index;
 
       if (chunk.type === 'block-start' && index !== undefined) {
-          if (String(chunk.blockType ?? 'text') === 'tool-call') sawToolCall = true;
           open.set(index, {
             type: String(chunk.blockType ?? 'text'),
             text: '',
@@ -588,19 +534,6 @@ async function* repair(
       );
 
       for (const closing of openBlocks(open, toolFix)) yield shift(closing);
-
-      // A broken stream that already wrote text is a cut-off answer, not a
-      // token cap. Continue it when the caller asked for that.
-      if (!hadToolCall && autoContinue && round < continueRounds && text !== '') {
-        round += 1;
-        carried += text;
-        offset = topIndex + 1;
-        if (armContinuation()) {
-          logger?.warn?.(`tool-call-repair: auto-continue ${round}/${continueRounds} after ${code}`);
-          continue;
-        }
-      }
-
       // tool-calls lets the loop dispatch the broken call: the tool rejects the
       // malformed arguments, the model reads that error and retries itself.
       yield { type: 'finish', reason: { kind: hadToolCall ? 'tool-calls' : 'max-tokens' } };
@@ -612,27 +545,21 @@ async function* repair(
       for (const closing of openBlocks(open, toolFix)) yield shift(closing);
     }
 
-    // A completion that carried neither text nor a tool call is not an answer.
-    // Report it as a retryable failure instead of letting the loop call it done.
-    if (finished && !truncated && emptyResponse && text.trim() === '' && !sawToolCall) {
-      const streak = bumpEmptyStreak();
-      if (streak <= emptyRetries) {
-        logger?.warn?.(`tool-call-repair: empty response ${streak}/${emptyRetries}; retrying`);
-        yield { type: 'finish', reason: { kind: 'error', failure: { code: 'EMPTY_RESPONSE' } } };
-        return;
-      }
-      logger?.warn?.(
-        `tool-call-repair: empty response budget spent (${streak}/${emptyRetries}); ending as stop`,
-      );
-    }
-    if (text.trim() !== '' || sawToolCall) resetEmptyStreak();
-
     // Continue past the provider's output ceiling instead of ending the turn.
     if (truncated && autoContinue && round < continueRounds && text !== '') {
       round += 1;
       carried += text;
       offset = topIndex + 1;
-      if (!armContinuation()) {
+      const messages = Array.isArray(options.messages) ? options.messages : [];
+      try {
+        options.messages = [
+          ...messages,
+          { role: 'assistant', content: [{ type: 'text', text: carried }] },
+          { role: 'user', content: [{ type: 'text', text: '继续' }] },
+        ];
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        logger?.warn?.(`tool-call-repair: auto-continue could not arm; ending as max-tokens (${detail})`);
         yield { type: 'finish', reason: { kind: 'max-tokens' } };
         return;
       }

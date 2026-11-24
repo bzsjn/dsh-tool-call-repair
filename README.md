@@ -14,14 +14,6 @@
 
 这些是链路抖动，不是确定性 bug，重试即可恢复。
 
-还有两类「不报错但也没结果」的故障，客户端不兜就永远看不到提示：
-
-- 上游把输出预算烧在 thinking 上，正文退化成空或只有一个空格，却以 `end_turn` 正常收尾；
-  DSH 的 `preview()` 会 `trim()` 掉空白，于是这一轮被判定为「已完成」而正文为空
-- 撞上输出上限（或断流时已写了正文）后，`自动续写` 需要把已产出文本回填进请求；
-  DSH 传给 `llm/stream` 的 options 是只读对象，`options.messages = [...]` 会抛
-  `Cannot assign to read only property 'messages'`，续写静默失败，界面只剩「已达到输出 token 上限」
-
 ## 策略
 
 挂在 `agent/request-error` waterfall 上：
@@ -51,17 +43,20 @@
 
 降级后：带工具调用则结束为 `tool-calls`，工具拿到残缺参数 schema 失败、错误回给模型、模型自行重写；纯文本则结束为 `max-tokens`，本轮收尾、下一条继续。两种情况都不会死会话。
 
-## 开关
+## 配置项
 
 `cordis.patch.yml`：
 
 ```yaml
 config:
   工具修复: true
-  自动续写: true
-  续写轮数: 3
   空响应修复: true
-  空响应次数: 3
+  退化检测: true
+  退化阈值: 2
+  退化续跑: true
+  退化续跑上限: 3
+  历史清洗: true
+  历史清洗占位: true
   重试次数: 12
   token上限: 0
   maxRetriesPerTurn: 40
@@ -74,18 +69,31 @@ config:
 | 开关 | 作用 | 关闭时 |
 |---|---|---|
 | `工具修复` | 流层补发缺失的 `block-end`，把截断的 tool call 按 `tool-calls` 收尾并派发，模型读到参数错误后重写 | 不接管流，截断会照原样失败 |
-| `自动续写` | 撞上输出上限、或断流时已经写了正文，就带着已产出文本再发一轮接着写 | 直接按截断收尾，要手动「继续」 |
-| `续写轮数` | 自动续写的最大轮数，到顶即按截断收尾 | `0` 等于关闭续写 |
-| `空响应修复` | 流正常结束但既没有正文、也没有工具调用时，合成 `EMPTY_RESPONSE` 交给重试层，而不是静默完成 | 空响应照原样结束，界面显示「已完成」但正文为空 |
-| `空响应次数` | 连续空响应的重试上限 | `0` 不重试空响应 |
 | `重试次数` | 模型请求失败的重试上限。覆盖 `TRANSPORT`、`SERVER`、`TIMEOUT`、`RATE_LIMIT`、`EMPTY_RESPONSE`、`MALFORMED_RESPONSE` | `0` 完全不注册重试层 |
 | `token上限` | 本轮输出字符预算，达到即补 `block-end` 并按截断收尾 | `0` 不干预，交给服务端 |
+| `空响应修复` | 零内容的完成响应改写成 `EMPTY_RESPONSE` 失败帧，交给重试链 | 原样放行，空回答会被当成成功落库 |
+| `退化检测` | 思考流连续出现纯应答短句判定为复读，截断并按 `max-tokens` 收尾 | 不干预思考流 |
+| `退化阈值` | 同一短句连续出现几次算复读，默认 `2` | 越小越激进，`1` 会误伤正常应答 |
+| `退化续跑` | 截断后在本轮末尾推一条输入，让模型给结论或调工具 | 只截断，不推续跑 |
+| `退化续跑上限` | 同一轮最多续跑几次，默认 `3` | 防止截断→续跑→再截断的死循环 |
+| `历史清洗` | 发请求前把历史里 `content: []` 的 assistant 消息摘出去，阻止空回答污染后续轮次 | 历史原样发出，空回答会被反复带给上游 |
+| `历史清洗占位` | 清洗时用一条极简文本替身顶替空消息，保住 user/assistant 交替 | 整条删除，可能出现连续两条 user |
+| `历史清洗文本` | 占位替身的正文，默认「（本轮模型未产出内容）」 | — |
 
 `重试次数: 12` 的退避阶梯：1s,2s,4s,8s,16s,32s,64s,128s,240s ×4，累计约 20 分钟。DSH 内置 `llm-retry` 先跑 5 次（约 15 秒），然后本插件接着跑长窗口。
 
 `token上限` 按字符计，不是 token 数。中文约 1 字≈1 token，英文约 4 字符≈1 token，所以 32000 大致对应 8k–32k token 区间。服务端不认 `max_tokens`（实测传 200 却输出 13424），这个开关是客户端自己停。
 
-英文键 `repairStream` / `retryEnabled` / `maxRetries` / `dispatchTruncatedToolCalls` 仍然兼容，中文键优先。
+英文键 `repairStream` / `retryEnabled` / `maxRetries` / `dispatchTruncatedToolCalls` 仍然兼容，中文键优先。新增键同样接受英文别名：`emptyGuard` / `degenerate` / `degenerateThreshold` / `degenerateFragments` / `degenerateResume` / `degenerateResumeText` / `degenerateResumeLimit` / `historyClean` / `historyPlaceholder` / `historyPlaceholderText`。
+
+### 历史清洗与空响应修复的分工
+
+两者处理同一类故障的两端：
+
+- **空响应修复**在 `llm/stream` 出口，管**新的**空响应——转成 `EMPTY_RESPONSE` 失败帧，交给重试链，不让它落库。
+- **历史清洗**在 `agent/pre-step` 入口，管**旧的**空回答——已经被落库的那些，每次发请求前摘掉，避免污染继续传播。
+
+只开守卫，老会话里已有的空回答仍然会被反复送给上游；只开清洗，新产生的空响应还是会落库。两个一起开才闭环。
 
 ## 目录结构
 
@@ -96,14 +104,22 @@ dsh-tool-call-repair/
   package.json          入口声明：main / types / exports / dsh.bundle.patch
   cordis.patch.yml      bundle 层：insert 一条可开关的 entry
   tsconfig.json         编译 src 到 lib
-  src/index.ts          源文件（权威实现，改逻辑改这里）
-  lib/index.js          编译产物（运行时实际加载）
+  .build/pNN.js         0.5.0 起的手工分片（权威源，按编号合并）
+  scripts/build-lib.mjs    合并分片到 lib/index.js，--check 校验一致性
+  src/index.ts          0.4.7 的 TS 参考实现，待下版本同步
+  lib/index.js          运行时实际加载（由 build-lib.mjs 生成，不手改）
   lib/types/index.d.ts  类型声明
+  tests/                回归套件：stream-repair.mjs、degenerate.mjs、history-clean.mjs
+  CHANGELOG.md
   README.md
   icon.svg
 ```
 
-改逻辑先改 `src/index.ts` 再同步 `lib/index.js`。装了 `typescript` 后可直接 `pnpm build`。
+**0.5.0 起，改逻辑只改 `.build/pNN.js` 分片**，然后 `node scripts/build-lib.mjs` 重新生成
+`lib/index.js`，`--check` 校验一致性，`node tests/stream-repair.mjs` 之类的套件跑回归。
+`src/index.ts` 目前是 0.4.7 的 TS 参考实现（类型与注释），函数体尚未转写 0.5.0 的三层；
+环境里没有 `typescript` 时无法 `tsc`，所以别指望它和 `lib/` 逐行一致——行为以分片为准。
+装了 `typescript` 之后可以把分片转写回 `src/` 并恢复 `pnpm build` 构建链。
 
 ## 安装位置
 
@@ -126,23 +142,29 @@ profile 的 `cordis.patch.yml` 不再写 mount 行，避免双挂载。
 
 ## 验证
 
-回归套件（跑的是 `lib/index.js`，即 DSH 实际加载的产物）：
+回归套件（无需编译，直接跑产物）：
 
 ```bash
-node tests/stream-repair.mjs
+node tests/stream-repair.mjs    # 8 例：空响应、截断续写、断流、冻结 options
+node tests/degenerate.mjs       # 8 例：复读拦截、阈值、续跑上限、开关、标记消费
+node tests/history-clean.mjs    # 8 例：占位替换、删除模式、开关、工具/思考消息豁免
 ```
 
-8 条断言：空响应转 `EMPTY_RESPONSE`、纯空格正文算空响应、max-tokens 续写在只读 options 上成功、
-断流后自动续写、工具调用不被改写、开关全关时透传、数组冻结时降级、空响应预算用尽后放行。
+`npm test` 跑全部三个套件。
 
 日志判据：
 
 ```
 tool-call-repair: attempt 1 for MALFORMED_RESPONSE on turn 3 step 5 in 250ms
 tool-call-repair: budget spent for MALFORMED_RESPONSE on turn 3 step 5
-tool-call-repair: empty response 1/3; retrying
-tool-call-repair: auto-continue 1/3
+tool-call-repair: 思考段复读「好。」，截断本轮并按 max-tokens 收尾
+tool-call-repair: 命中行之后转入正文/工具，不拦截「好。」
+tool-call-repair: 上游返回零内容的完成响应，转成 EMPTY_RESPONSE
+tool-call-repair: 历史清洗 替换 1 条空回答（turn 34）
 ```
+
+看到「历史清洗 … 条空回答」说明老会话里已经落库的空回答被拦在请求之外了；这条日志
+每轮最多出现一次，数字是该轮被清掉的消息条数。
 
 ## 边界
 

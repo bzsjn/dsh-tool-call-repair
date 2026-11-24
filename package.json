@@ -1,7 +1,7 @@
 {
   "name": "dsh-tool-call-repair",
   "version": "0.4.8",
-  "description": "Keeps a turn alive when a model request fails recoverably: any failure code is retried with exponential backoff under a bounded budget, so transient gateway faults (truncated tool arguments, empty completions, early stream ends) do not end the task. Toggleable from the plugin manager.",
+  "description": "Keeps a turn alive and honest: recoverable request failures retry with exponential backoff under a bounded budget, empty completions become a retryable EMPTY_RESPONSE instead of a silent empty answer, degenerate filler loops in the reasoning stream are truncated and resumed, and content-less assistant messages are filtered out of the outgoing history — so transient gateway faults, zero-content responses, reasoning loops and polluted history no longer end the task.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -21,9 +21,11 @@
     "lib/client.js",
     "lib/types/**/*.d.ts",
     "cordis.patch.yml",
+    ".build",
     "src",
     "tsconfig.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "icon.svg"
   ],
@@ -34,7 +36,10 @@
     "bundle",
     "tool-call",
     "retry",
-    "malformed-response"
+    "malformed-response",
+    "empty-response",
+    "degenerate-loop",
+    "history-clean"
   ],
   "icon": "./icon.svg",
   "license": "MIT",
@@ -65,9 +70,13 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:lib": "node scripts/build-lib.mjs",
+    "build:lib:check": "node scripts/build-lib.mjs --check",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node tests/stream-repair.mjs && node tests/degenerate.mjs && node tests/history-clean.mjs",
     "index": "node scripts/build-index.mjs",
-    "index:check": "node scripts/build-index.mjs --check"
+    "index:check": "node scripts/build-index.mjs --check",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.19.0"

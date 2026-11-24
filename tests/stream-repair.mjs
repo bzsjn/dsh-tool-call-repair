@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { apply } from '../lib/index.js';
 
-const BASE = { 工具修复: true, 自动续写: true, 续写轮数: 3, 空响应修复: true, 空响应次数: 3 };
+const BASE = { 工具修复: true, 自动续写: true, 续写轮数: 3, 空响应修复: true, 退化检测: false };
 
 function makeCtx(logs) {
   const handlers = {};
@@ -120,7 +120,7 @@ test('工具调用不被改写', async () => {
 // 6. 全部关闭 → 完全透传，行为回到 0.4.7
 test('开关全关时透传', async () => {
   const { out, calls } = await run(
-    { 工具修复: false, 自动续写: false, 空响应修复: false },
+    { 工具修复: false, 自动续写: false, 空响应修复: false, 退化检测: false },
     Object.freeze({ messages: [] }),
     emptyStream,
   );
@@ -137,15 +137,37 @@ test('数组冻结时降级为 max-tokens', async () => {
   assert.ok(logs.some((m) => m.includes('could not arm')));
 });
 
-// 8. 空响应次数用尽 → 不再重试，按 stop 收尾
-test('空响应预算用尽后放行', async () => {
+// 8. 空响应修复关闭 → 原样放行
+test('空响应修复关闭后放行', async () => {
+  const { out } = await run(
+    { ...BASE, 空响应修复: false },
+    Object.freeze({ messages: [] }),
+    emptyStream,
+  );
+  assert.equal(lastFinish(out).reason.kind, 'stop');
+});
+
+// 9. 空响应次数用尽 → 不再转 EMPTY_RESPONSE，按 stop 收尾（上游 0.4.8 的语义）
+test('空响应次数用尽后按 stop 收尾', async () => {
+  const config = { ...BASE, 空响应次数: 1 };
+  const first = await run(config, Object.freeze({ messages: [] }), emptyStream);
+  assert.equal(lastFinish(first.out).reason.kind, 'error');
+  assert.ok(first.logs.some((m) => m.includes('EMPTY_RESPONSE')));
+
+  const second = await run(config, Object.freeze({ messages: [] }), emptyStream);
+  assert.equal(lastFinish(second.out).reason.kind, 'stop');
+  assert.ok(second.logs.some((m) => m.includes('空响应次数已用尽')));
+});
+
+// 10. 空响应次数为 0 → 从不重试，直接按 stop 收尾
+test('空响应次数为 0 时不重试', async () => {
   const { out, logs } = await run(
     { ...BASE, 空响应次数: 0 },
     Object.freeze({ messages: [] }),
     emptyStream,
   );
   assert.equal(lastFinish(out).reason.kind, 'stop');
-  assert.ok(logs.some((m) => m.includes('budget spent')) || out.length > 0);
+  assert.ok(logs.some((m) => m.includes('空响应次数已用尽')));
 });
 
 let failed = 0;

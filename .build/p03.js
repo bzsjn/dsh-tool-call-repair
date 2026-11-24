@@ -1,0 +1,25 @@
+
+/** 插件管理页渲染成表单的 schema；`.volatile()` 的字段可以在页面上改。 */
+export const Config = z.object({
+  工具修复: z.boolean().default(true).description('流层协议修复：补发缺失的 block-end，按 tool-calls 收尾并派发被截断的调用').volatile(),
+  自动续写: z.boolean().default(false).description('达到输出上限后自动再发一次请求接着写，不中断本轮').volatile(),
+  续写轮数: z.natural().default(3).description('自动续写的最大轮数，到顶即按截断收尾').volatile(),
+  重试次数: z.natural().default(12).description('模型请求失败的重试上限，0 表示不重试').volatile(),
+  token上限: z.natural().default(0).description('本轮输出字符预算，达到即截断收尾，0 表示不干预').volatile(),
+  空响应修复: z.boolean().default(true).description('上游回了 stop 却零内容时抛出 EMPTY_RESPONSE 交给重试层，不再静默落库').volatile(),
+  空响应次数: z.natural().default(3).description('连续空响应的重试上限，0 表示不重试').volatile(),
+  退化检测: z.boolean().default(true).description('思考段陷入短句复读时截断本轮').volatile(),
+  退化阈值: z.natural().default(2).description('连续出现几次填充短句才判为复读，1 最激进').volatile(),
+  退化词表: z.array(z.string()).default([...DEFAULT_FRAGMENTS]).description('整行匹配的填充短句表').volatile(),
+  退化续跑: z.boolean().default(true).description('截断后在本轮边界推一条输入让本轮继续').volatile(),
+  退化续跑文案: z.string().default(DEFAULTS.degResumeText).description('续跑时注入的正文').volatile(),
+  退化续跑上限: z.natural().default(3).description('同一轮最多续跑几次').volatile(),
+  历史清洗: z.boolean().default(true).description('发请求前剔除历史里 content 为空的 assistant 消息，阻止空回答污染后续轮次').volatile(),
+  历史清洗占位: z.boolean().default(true).description('清洗时用一条极简文本替身顶替空消息，保住 user/assistant 交替；关掉则直接删除').volatile(),
+  历史清洗文本: z.string().default(DEFAULTS.historyPlaceholderText).description('占位替身的正文').volatile(),
+  maxRetriesPerTurn: z.natural().default(40).description('每个 turn 加 step 的重试总预算').volatile(),
+  codes: z.array(z.string()).default(['*']).description('参与重试的失败码，* 表示全部').volatile(),
+  initialDelayMs: z.natural().default(1000).description('首次退避毫秒，之后指数翻倍').volatile(),
+  maxDelayMs: z.natural().default(240000).description('单次退避上限毫秒').volatile(),
+  jitterRatio: z.number().min(0).max(1).default(0.2).description('退避抖动比例，0 到 1').volatile(),
+});
