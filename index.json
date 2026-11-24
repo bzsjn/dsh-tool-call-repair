@@ -28,7 +28,7 @@
         "zh": "dsh-tool-call-repair"
       },
       "description": {
-        "en": "Keeps a turn alive when a model request fails recoverably: any failure code is retried with exponential backoff under a bounded budget, so transient gateway faults (truncated tool arguments, empty completions, early stream ends) do not end the task. Toggleable from the plugin manager."
+        "en": "Keeps a turn alive and honest: recoverable request failures retry with exponential backoff under a bounded budget, empty completions become a retryable EMPTY_RESPONSE instead of a silent empty answer, degenerate filler loops in the reasoning stream are truncated and resumed, and content-less assistant messages are filtered out of the outgoing history — so transient gateway faults, zero-content responses, reasoning loops and polluted history no longer end the task."
       },
       "icon": "icon.svg",
       "author": "bzsjn",
@@ -45,12 +45,27 @@
           "bundle",
           "tool-call",
           "retry",
-          "malformed-response"
+          "malformed-response",
+          "empty-response",
+          "degenerate-loop",
+          "history-clean"
         ],
         "labels": [],
         "sortKeys": {}
       },
       "versions": [
+        {
+          "version": "0.5.0",
+          "publishTimestamp": 1795511262,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/bzsjn/dsh-tool-call-repair",
+            "commit": "0695b95a2fb31627ab53c6082e795dd42c79e204"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.1 <0.3.0"
+          }
+        },
         {
           "version": "0.4.8",
           "publishTimestamp": 1794908960,
