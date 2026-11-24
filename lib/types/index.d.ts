@@ -28,6 +28,14 @@ export interface Config {
     '历史清洗占位'?: boolean;
     /** 历史清洗文本：占位文本正文。 */
     '历史清洗文本'?: string;
+    /** 定向供应商：按供应商特性单独补偿的 provider id 列表，留空即关闭。 */
+    '定向供应商'?: string[];
+    /** 定向输出上限：命中的 provider 把 maxTokens 钳到此值，0 表示不钳。 */
+    '定向输出上限'?: number;
+    /** 定向重试次数：命中的 provider 单个 turn+step 的重试上限。 */
+    '定向重试次数'?: number;
+    /** 定向空响应次数：命中的 provider 连续空响应的重试上限。 */
+    '定向空响应次数'?: number;
     /** 重试次数：同一 step 的重试预算。 */
     '重试次数'?: number;
     /** token 上限：正文累计超过后主动收口，0 表示不限。 */
@@ -88,6 +96,7 @@ export interface PluginContext {
     };
     on(event: 'llm/stream', listener: (options: unknown, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>, options?: { global?: boolean }): void;
     on(event: 'agent/request-error', listener: (payload: RequestErrorPayload, next: () => Promise<RequestErrorAction>) => Promise<RequestErrorAction>): void;
+    on(event: 'agent/request', listener: (payload: { turn?: number; step?: number; signal?: AbortSignal }, next: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>): void;
     on(event: 'agent/pre-step', listener: (payload: { turn?: number; step?: number }, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>): void;
     on(event: 'agent/turn-stopping', listener: (payload: { agent?: object }) => void): void;
 }

@@ -73,7 +73,7 @@
     "build:lib": "node scripts/build-lib.mjs",
     "build:lib:check": "node scripts/build-lib.mjs --check",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node tests/stream-repair.mjs && node tests/degenerate.mjs && node tests/history-clean.mjs",
+    "test": "node tests/stream-repair.mjs && node tests/degenerate.mjs && node tests/history-clean.mjs && node tests/scoped-provider.mjs",
     "index": "node scripts/build-index.mjs",
     "index:check": "node scripts/build-index.mjs --check",
     "release": "node scripts/release.mjs"

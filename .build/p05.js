@@ -32,6 +32,21 @@
       ? historyTextRaw
       : DEFAULTS.historyPlaceholderText;
 
+  // 定向供应商：只有 id 命中白名单的请求才走补偿逻辑，其余原样放行。
+  const scopedRaw = raw['定向供应商'] ?? raw.scopedProviders;
+  const scopedProviders = Array.isArray(scopedRaw)
+    ? scopedRaw.map((item) => String(item).trim()).filter((item) => item.length > 0)
+    : [...DEFAULTS.scopedProviders];
+  const scopedMaxTokens = Math.floor(
+    positive(raw['定向输出上限'] ?? raw.scopedMaxTokens, DEFAULTS.scopedMaxTokens),
+  );
+  const scopedRetries = Math.floor(
+    positive(raw['定向重试次数'] ?? raw.scopedRetries, DEFAULTS.scopedRetries),
+  );
+  const scopedEmptyRetries = Math.floor(
+    positive(raw['定向空响应次数'] ?? raw.scopedEmptyRetries, DEFAULTS.scopedEmptyRetries),
+  );
+
   return {
     toolFix,
     retries,
@@ -53,6 +68,10 @@
     historyClean,
     historyPlaceholder,
     historyPlaceholderText,
+    scoped: new Set(scopedProviders),
+    scopedMaxTokens,
+    scopedRetries,
+    scopedEmptyRetries,
     anyCode: codes.includes('*'),
     codes: new Set(codes),
     initialDelayMs: positive(raw.initialDelayMs, DEFAULTS.initialDelayMs),

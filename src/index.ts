@@ -80,6 +80,14 @@ interface ConfigShape {
   '历史清洗占位'?: boolean;
   /** 历史清洗文本：占位替身的正文。 */
   '历史清洗文本'?: string;
+  /** 定向供应商：按供应商特性单独补偿的 provider id 列表，留空即关闭。 */
+  '定向供应商'?: string[];
+  /** 定向输出上限：命中的 provider 把 maxTokens 钳到此值，0 表示不钳。 */
+  '定向输出上限'?: number;
+  /** 定向重试次数：命中的 provider 单个 turn+step 的重试上限。 */
+  '定向重试次数'?: number;
+  /** 定向空响应次数：命中的 provider 连续空响应的重试上限。 */
+  '定向空响应次数'?: number;
 }
 
 interface Logger {

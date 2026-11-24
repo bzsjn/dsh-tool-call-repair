@@ -58,4 +58,10 @@ const DEFAULTS = {
   historyClean: true,
   historyPlaceholder: true,
   historyPlaceholderText: '（本轮模型未产出内容）',
+  // —— 按供应商定向补偿。默认只含中转站里那个输出被硬顶的端点，
+  // 判定用 `options.provider`，不碰任何全局配置。
+  scopedProviders: ['daapsaak'],
+  scopedMaxTokens: 32768,
+  scopedRetries: 8,
+  scopedEmptyRetries: 5,
 };

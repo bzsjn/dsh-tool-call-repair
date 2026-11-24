@@ -22,15 +22,15 @@
     const emptyStop = emptyResponse && !visible && (!finished || upstreamReason?.kind === 'stop');
     if (emptyStop) {
       const streak = bumpEmptyStreak();
-      if (emptyRetries > 0 && streak <= emptyRetries) {
+      if (emptyLimit > 0 && streak <= emptyLimit) {
         logger?.warn?.(
-          `tool-call-repair: 上游返回零内容的完成响应 ${streak}/${emptyRetries}，转成 EMPTY_RESPONSE`,
+          `tool-call-repair: 上游返回零内容的完成响应 ${streak}/${emptyLimit}${scoped ? '（定向）' : ''}，转成 EMPTY_RESPONSE`,
         );
         yield emptyResponseFrame();
         return;
       }
       logger?.warn?.(
-        `tool-call-repair: 空响应次数已用尽（${streak}/${emptyRetries}），不再重试，按 stop 收尾`,
+        `tool-call-repair: 空响应次数已用尽（${streak}/${emptyLimit}），不再重试，按 stop 收尾`,
       );
     } else if (visible) {
       resetEmptyStreak();

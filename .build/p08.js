@@ -73,7 +73,7 @@ export function apply(ctx, config) {
     });
   });
 
-  function takeBudget(live, agent, turn, step) {
+  function takeBudget(live, agent, turn, step, stepLimit) {
     let turnRecord = turns.get(agent);
     if (turnRecord === undefined || turnRecord.turn !== turn) {
       turnRecord = { turn, used: 0 };
@@ -86,7 +86,9 @@ export function apply(ctx, config) {
       stepRecord = { turn, step, used: 0 };
       steps.set(agent, stepRecord);
     }
-    if (stepRecord.used >= live.retries) return undefined;
+    // 定向供应商可以用更大的单 step 预算，但仍然受 turn 总预算约束。
+    const cap = stepLimit === undefined ? live.retries : stepLimit;
+    if (stepRecord.used >= cap) return undefined;
 
     stepRecord.used += 1;
     turnRecord.used += 1;

@@ -83,3 +83,26 @@ function resetEmptyStreak() {
   EMPTY_STREAK.count = 0;
   EMPTY_STREAK.at = 0;
 }
+
+/**
+ * 这个 provider 是否命中定向补偿白名单。
+ *
+ * 只看请求自带的 provider id：不改全局配置、不按 baseURL 猜、不波及其他
+ * 供应商。白名单留空即整体关闭。
+ */
+function isScoped(provider, live) {
+  if (!(live?.scoped instanceof Set) || live.scoped.size === 0) return false;
+  if (typeof provider !== 'string' || provider.length === 0) return false;
+  return live.scoped.has(provider);
+}
+
+/**
+ * 把 maxTokens 钳到定向上限。水牌值（1048576 这种等于上下文窗口的数）发给
+ * 中转站没有收益，只会让上游按自己的口径乱来。`limit` 为 0 表示不钳。
+ */
+function clampMaxTokens(config, limit) {
+  if (!(limit > 0)) return config;
+  const current = config.maxTokens;
+  if (typeof current !== 'number' || current <= limit) return config;
+  return { ...config, maxTokens: limit };
+}
