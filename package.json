@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-call-repair",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Keeps a turn alive and honest: recoverable request failures retry with exponential backoff under a bounded budget, empty completions become a retryable EMPTY_RESPONSE instead of a silent empty answer, degenerate filler loops in the reasoning stream are truncated and resumed, and content-less assistant messages are filtered out of the outgoing history — so transient gateway faults, zero-content responses, reasoning loops and polluted history no longer end the task.",
   "type": "module",
   "main": "lib/index.js",
